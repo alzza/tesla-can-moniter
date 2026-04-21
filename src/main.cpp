@@ -1,19 +1,42 @@
 #include <Arduino.h>
+#include <TFT_eSPI.h>
+#include <Preferences.h>
+#include <esp_arduino_version.h>
+#include <esp_system.h>
+#include <math.h>
+#include "ui.h"
+
+#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
+#include <esp32-hal-bt.h>
+#endif
+
+#ifndef ENABLE_WIFI_RADIO
+#define ENABLE_WIFI_RADIO 1
+#endif
+
+#ifndef UI_CPU_MHZ
+#define UI_CPU_MHZ 80
+#endif
+
+#if ENABLE_WIFI_RADIO
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
-#include <TFT_eSPI.h>
-#include <esp_arduino_version.h>
-#include <math.h>
+#endif
 
 struct __attribute__((packed)) struct_message {
+    // 송신기 업타임(초)
     uint32_t uptime;
+    // 메인 A/B 채널 주기
     float hz_a;
     float hz_b;
+    // 기능 활성 상태 플래그
     bool nag_active;
     bool eap_active;
+    // 모드/상태 값(신규 페이로드 포맷)
     uint8_t nag_mode;
     uint8_t twai_state;
+    // 진단 카운터
     uint32_t echo_count;
     uint32_t tx_fail_count;
     uint32_t a_frames_total;
@@ -39,26 +62,6 @@ struct __attribute__((packed)) legacy_message {
 
 static_assert(sizeof(legacy_message) == 22, "legacy_message size mismatch");
 
-struct UiState {
-    uint32_t uptime = 0;
-    float hzA = 0.0f;
-    float hzB = 0.0f;
-    bool nag = false;
-    bool eap = false;
-    uint8_t nagMode = 0;
-    uint8_t twaiState = 0;
-    uint32_t echoCount = 0;
-    uint32_t txFailCount = 0;
-    uint32_t aFramesTotal = 0;
-    uint32_t aFrames1021 = 0;
-    uint32_t aEapModified = 0;
-    uint32_t bFramesTotal = 0;
-    uint32_t bFrames880 = 0;
-    uint32_t bFrames921 = 0;
-    uint32_t bBusoffCount = 0;
-    bool linked = false;
-};
-
 static TFT_eSPI tft;
 static TFT_eSprite canvas = TFT_eSprite(&tft);
 
@@ -66,25 +69,90 @@ static portMUX_TYPE gDataMux = portMUX_INITIALIZER_UNLOCKED;
 static struct_message gLatestMsg = {};
 static bool gHasData = false;
 static uint32_t gLastRxMs = 0;
-static uint8_t gLastSenderMac[6] = {0};
+static uint8_t gLastSenderMac[6] = {0}; 
+static uint32_t gRxPacketCount = 0;
+static uint32_t gBadLengthPacketCount = 0;
 
 static UiState gShown = {};
 
 static constexpr uint8_t kWifiChannel = 1;
 static constexpr uint32_t kRenderIntervalMs = 100;
-static constexpr uint32_t kLinkTimeoutMs = 2000;
+static constexpr uint32_t kLinkTimeoutMs = 3200;
 static constexpr uint32_t kNoSignalBlinkMs = 450;
+static constexpr uint32_t kChannelCheckIntervalMs = 3000;
 static constexpr uint32_t kPageButtonMinIntervalMs = 140;
-static constexpr uint8_t kButtonUpPin = 0;
-static constexpr uint8_t kButtonDownPin = 14;
+static constexpr uint8_t kLinkMissDebounceFrames = 4;
+static constexpr uint8_t kButtonUpPin = 14;
+static constexpr uint8_t kButtonDownPin = 0;
+static constexpr uint8_t kBacklightPin = 38;
+static constexpr uint8_t kBrightnessStepPercent = 10;
+static constexpr uint32_t kBrightnessEnterHoldMs = 3000;
+static constexpr uint32_t kBrightnessIdleSaveMs = 3000;
+static constexpr uint32_t kButtonDebounceMs = 30;
+static constexpr uint32_t kBrightnessRepeatStartMs = 400;
+static constexpr uint32_t kBrightnessRepeatIntervalMs = 120;
+static constexpr uint8_t kBacklightLevelMax = 16;
+static constexpr uint8_t kBacklightLevelMin = 1;
 static constexpr uint8_t kNagModeDynamic = 0;
 static constexpr uint8_t kNagModeFixed = 1;
+static constexpr uint8_t kPageCount = 4;
+
+enum class UiMode : uint8_t {
+    PageView = 0,
+    BrightnessAdjust = 1,
+    SystemEdit = 2,
+};
+
+enum class SystemItem : uint8_t {
+    CpuProfile = 0,
+    WifiRuntime = 1,
+    BluetoothBuild = 2,
+    BrightnessQuick = 3,
+};
+
+static constexpr uint8_t kSystemItemCount = 4;
+static constexpr uint32_t kSystemEditEnterHoldMs = 2000;
+static constexpr uint32_t kSystemEditExecHoldMs = 1000;
+static constexpr uint32_t kSystemEditExitHoldMs = 1500;
 
 static uint8_t gCurrentPage = 0;
 static bool gPrevBtnUp = true;
 static bool gPrevBtnDown = true;
 static uint32_t gLastPageChangeMs = 0;
 static bool gPageDirty = false;
+static uint32_t gLastChannelCheckMs = 0;
+static bool gPrevLinked = false;
+static uint8_t gLinkMissStreak = 0;
+static UiMode gUiMode = UiMode::PageView;
+static bool gLongPressConsumed = false;
+static uint8_t gSavedPageBeforeBrightness = 0;
+static uint8_t gBrightnessPercent = 80;
+static uint32_t gBrightnessLastInputMs = 0;
+static uint8_t gBacklightLevel = 0;
+static uint32_t gCpuTargetMhz = UI_CPU_MHZ;
+static bool gWifiRuntimeEnabled = (ENABLE_WIFI_RADIO != 0);
+static bool gBluetoothRuntimeEnabled =
+#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
+    true;
+#else
+    false;
+#endif
+
+static bool gUpRaw = false;
+static bool gDownRaw = false;
+static bool gUpStable = false;
+static bool gDownStable = false;
+static uint32_t gUpRawChangedMs = 0;
+static uint32_t gDownRawChangedMs = 0;
+static uint32_t gUpPressedStartMs = 0;
+static uint32_t gDownPressedStartMs = 0;
+static uint32_t gUpRepeatMs = 0;
+static uint32_t gDownRepeatMs = 0;
+static uint8_t gSystemSelected = 0;
+static bool gSystemUpExecConsumed = false;
+static bool gSystemDownExitConsumed = false;
+static bool gBrightnessUpHoldConsumed = false;
+static bool gBrightnessDownHoldConsumed = false;
 
 static uint16_t colBg;
 static uint16_t colPanel;
@@ -95,6 +163,126 @@ static uint16_t colOff;
 static uint16_t colHz;
 static uint16_t colAccent;
 static uint16_t colTrack;
+
+static uint8_t clampBrightnessPercent(uint8_t value)
+{
+    if (value > 100) return 100;
+    return (uint8_t)((value / kBrightnessStepPercent) * kBrightnessStepPercent);
+}
+
+static uint32_t sanitizeCpuProfile(uint32_t mhz)
+{
+    if (mhz <= 80) return 80;
+    return 160;
+}
+
+static uint8_t brightnessPercentToLevel(uint8_t percent)
+{
+    uint8_t level = (uint8_t)(((uint32_t)percent * kBacklightLevelMax + 50u) / 100u);
+    if (level < kBacklightLevelMin) level = kBacklightLevelMin;
+    return level;
+}
+
+static void setBacklightLevel(uint8_t value)
+{
+    uint8_t target = (value > kBacklightLevelMax) ? kBacklightLevelMax : value;
+    if (target < kBacklightLevelMin) target = kBacklightLevelMin;
+
+    if (gBacklightLevel == 0) {
+        digitalWrite(kBacklightPin, HIGH);
+        gBacklightLevel = kBacklightLevelMax;
+        delayMicroseconds(30);
+    }
+
+    const int from = (int)kBacklightLevelMax - (int)gBacklightLevel;
+    const int to = (int)kBacklightLevelMax - (int)target;
+    const int pulseCount = ((int)kBacklightLevelMax + to - from) % (int)kBacklightLevelMax;
+
+    for (int i = 0; i < pulseCount; ++i) {
+        digitalWrite(kBacklightPin, LOW);
+        digitalWrite(kBacklightPin, HIGH);
+    }
+
+    gBacklightLevel = target;
+}
+
+static void applyBacklightPercent(uint8_t percent)
+{
+    gBrightnessPercent = clampBrightnessPercent(percent);
+    setBacklightLevel(brightnessPercentToLevel(gBrightnessPercent));
+}
+
+static uint8_t loadBrightnessPercent(uint8_t fallback)
+{
+    Preferences prefs;
+    uint8_t value = fallback;
+    if (prefs.begin("settings", true)) {
+        value = prefs.getUChar("bright", fallback);
+        prefs.end();
+    }
+    return clampBrightnessPercent(value);
+}
+
+static void saveBrightnessPercent(uint8_t value)
+{
+    Preferences prefs;
+    if (!prefs.begin("settings", false)) return;
+    prefs.putUChar("bright", clampBrightnessPercent(value));
+    prefs.end();
+}
+
+static void loadRuntimeSettings()
+{
+    Preferences prefs;
+    if (!prefs.begin("settings", true)) {
+        gCpuTargetMhz = sanitizeCpuProfile(UI_CPU_MHZ);
+        gWifiRuntimeEnabled = (ENABLE_WIFI_RADIO != 0);
+        gBluetoothRuntimeEnabled =
+#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
+            true;
+#else
+            false;
+#endif
+        return;
+    }
+
+    gCpuTargetMhz = sanitizeCpuProfile(prefs.getUInt("cpu_mhz", UI_CPU_MHZ));
+    gWifiRuntimeEnabled = prefs.getBool("wifi_on", (ENABLE_WIFI_RADIO != 0));
+    gBluetoothRuntimeEnabled = prefs.getBool("bt_on", true);
+    prefs.end();
+
+#if !ENABLE_WIFI_RADIO
+    gWifiRuntimeEnabled = false;
+#endif
+
+#if !(defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED)
+    gBluetoothRuntimeEnabled = false;
+#endif
+}
+
+static void saveCpuProfile(uint32_t mhz)
+{
+    Preferences prefs;
+    if (!prefs.begin("settings", false)) return;
+    prefs.putUInt("cpu_mhz", sanitizeCpuProfile(mhz));
+    prefs.end();
+}
+
+static void saveWifiRuntimeEnabled(bool enabled)
+{
+    Preferences prefs;
+    if (!prefs.begin("settings", false)) return;
+    prefs.putBool("wifi_on", enabled);
+    prefs.end();
+}
+
+static void saveBluetoothRuntimeEnabled(bool enabled)
+{
+    Preferences prefs;
+    if (!prefs.begin("settings", false)) return;
+    prefs.putBool("bt_on", enabled);
+    prefs.end();
+}
 
 static const char* nagModeToText(uint8_t mode)
 {
@@ -109,264 +297,352 @@ static const char* twaiStateToText(uint8_t state)
     return "INIT";
 }
 
-static void drawHzTiles(TFT_eSprite& spr, float hzA, float hzB);
+static bool initEspNowReceiver();
 
-static int roundToInt(float v)
+static const char* wifiStatusText()
 {
-    return (int)lroundf(v);
+#if ENABLE_WIFI_RADIO
+    if (!gWifiRuntimeEnabled) return "OFF(RUNTIME)";
+    if (WiFi.getMode() == WIFI_OFF) return "OFF(RUNTIME)";
+    return "ON";
+#else
+    return "OFF(BUILD)";
+#endif
 }
 
-static void drawBackdrop(TFT_eSprite& spr)
+static const char* btStatusText()
 {
-    spr.fillSprite(colBg);
-    spr.drawFastVLine(2, 0, 170, colTrack);
-    spr.drawFastVLine(317, 0, 170, colTrack);
+#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
+    if (!gBluetoothRuntimeEnabled) return "OFF(RUNTIME)";
+    return "ON";
+#else
+    return "OFF(BUILD)";
+#endif
 }
 
-static void drawStatusTiles(TFT_eSprite& spr, bool nagOn, bool eapOn)
+static void applyWifiBtCoexistPolicy()
 {
-    const int y = 8;
-    const int h = 76;
-    const int w = 148;
-    const uint16_t eapColor = eapOn ? colOn : colOff;
-    const uint16_t nagColor = nagOn ? colOn : colOff;
-
-    // EAP tile (left-top)
-    spr.fillRoundRect(8, y, w, h, 8, colPanel);
-    spr.drawRoundRect(8, y, w, h, 8, colAccent);
-    spr.drawRoundRect(9, y + 1, w - 2, h - 2, 8, colTrack);
-    spr.fillCircle(22, y + 16, 5, eapColor);
-    spr.setTextFont(2);
-    spr.setTextDatum(TL_DATUM);
-    spr.setTextColor(colMuted, colPanel);
-    spr.drawString("EAP", 34, y + 8);
-    spr.setTextFont(4);
-    spr.setTextDatum(MC_DATUM);
-    spr.setTextColor(eapColor, colPanel);
-    spr.drawString(eapOn ? "ON" : "OFF", 82, y + 45);
-
-    // NAG tile (right-top)
-    spr.fillRoundRect(164, y, w, h, 8, colPanel);
-    spr.drawRoundRect(164, y, w, h, 8, colAccent);
-    spr.drawRoundRect(165, y + 1, w - 2, h - 2, 8, colTrack);
-    spr.fillCircle(178, y + 16, 5, nagColor);
-    spr.setTextFont(2);
-    spr.setTextDatum(TL_DATUM);
-    spr.setTextColor(colMuted, colPanel);
-    spr.drawString("NAG", 190, y + 8);
-    spr.setTextFont(4);
-    spr.setTextDatum(MC_DATUM);
-    spr.setTextColor(nagColor, colPanel);
-    spr.drawString(nagOn ? "ON" : "OFF", 238, y + 45);
+#if ENABLE_WIFI_RADIO
+    if (WiFi.getMode() == WIFI_OFF) return;
+#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
+    if (gBluetoothRuntimeEnabled) {
+        WiFi.setSleep(true);
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        Serial.println("[SYS] Coexist: WiFi modem sleep ON (BT enabled)");
+        return;
+    }
+#endif
+    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    Serial.println("[SYS] Coexist: WiFi modem sleep OFF");
+#endif
 }
 
-static void drawPageHeader(TFT_eSprite& spr, uint8_t page, const char* title)
+static void applyCpuProfile(uint32_t mhz)
 {
-    spr.fillRoundRect(8, 4, 304, 22, 6, colPanel);
-    spr.drawRoundRect(8, 4, 304, 22, 6, colAccent);
-    spr.setTextFont(2);
-    spr.setTextDatum(TL_DATUM);
-    spr.setTextColor(colMuted, colPanel);
-    spr.drawString("UP/DN: PAGE", 14, 9);
-    spr.setTextDatum(MC_DATUM);
-    spr.setTextColor(colText, colPanel);
-    spr.drawString(title, 160, 15);
-
-    char pageBuf[16];
-    snprintf(pageBuf, sizeof(pageBuf), "%u/3", (unsigned)(page + 1));
-    spr.setTextDatum(TR_DATUM);
-    spr.setTextColor(colHz, colPanel);
-    spr.drawString(pageBuf, 304, 9);
+    gCpuTargetMhz = sanitizeCpuProfile(mhz);
+    if (getCpuFrequencyMhz() != gCpuTargetMhz) {
+        if (!setCpuFrequencyMhz(gCpuTargetMhz)) {
+            gCpuTargetMhz = 80;
+            setCpuFrequencyMhz(gCpuTargetMhz);
+            Serial.println("[SYS] CPU profile set failed, fallback to 80 MHz");
+        }
+        Serial.printf("[SYS] CPU profile -> %u MHz\n", (unsigned)getCpuFrequencyMhz());
+    }
+    saveCpuProfile(gCpuTargetMhz);
 }
 
-static void drawMainPage(TFT_eSprite& spr, const UiState& state)
+static void cycleCpuProfile()
 {
-    drawStatusTiles(spr, state.nag, state.eap);
-    drawHzTiles(spr, state.hzA, state.hzB);
-
-    spr.fillRoundRect(164, 66, 148, 16, 5, colPanel);
-    spr.setTextFont(2);
-    spr.setTextDatum(MC_DATUM);
-    spr.setTextColor(colMuted, colPanel);
-    spr.drawString(nagModeToText(state.nagMode), 238, 74);
-}
-
-static void drawRow(TFT_eSprite& spr, int y, const char* key, const char* value)
-{
-    spr.setTextFont(2);
-    spr.setTextDatum(TL_DATUM);
-    spr.setTextColor(colMuted, colBg);
-    spr.drawString(key, 12, y);
-    spr.setTextDatum(TR_DATUM);
-    spr.setTextColor(colText, colBg);
-    spr.drawString(value, 308, y);
-    spr.drawFastHLine(10, y + 16, 300, colTrack);
-}
-
-static void drawAChannelPage(TFT_eSprite& spr, const UiState& state)
-{
-    char v[32];
-    snprintf(v, sizeof(v), "%d Hz", roundToInt(state.hzA));
-    drawRow(spr, 34, "A Frame Rate", v);
-
-    snprintf(v, sizeof(v), "%lu", (unsigned long)state.aFramesTotal);
-    drawRow(spr, 54, "A Frames Total", v);
-
-    snprintf(v, sizeof(v), "%lu", (unsigned long)state.aFrames1021);
-    drawRow(spr, 74, "A ID 1021", v);
-
-    snprintf(v, sizeof(v), "%lu", (unsigned long)state.aEapModified);
-    drawRow(spr, 94, "A EAP Modified", v);
-
-    drawRow(spr, 114, "EAP Runtime", state.eap ? "ON" : "OFF");
-
-    snprintf(v, sizeof(v), "%lu s", (unsigned long)state.uptime);
-    drawRow(spr, 134, "Uptime", v);
-}
-
-static void drawBChannelPage(TFT_eSprite& spr, const UiState& state)
-{
-    char v[32];
-    snprintf(v, sizeof(v), "%d Hz", roundToInt(state.hzB));
-    drawRow(spr, 34, "B Frame Rate", v);
-
-    snprintf(v, sizeof(v), "%lu", (unsigned long)state.bFramesTotal);
-    drawRow(spr, 54, "B Frames Total", v);
-
-    snprintf(v, sizeof(v), "%lu / %lu", (unsigned long)state.bFrames880, (unsigned long)state.bFrames921);
-    drawRow(spr, 74, "B ID 880/921", v);
-
-    snprintf(v, sizeof(v), "%lu", (unsigned long)state.echoCount);
-    drawRow(spr, 94, "B Echo Count", v);
-
-    drawRow(spr, 114, "Nag Mode", nagModeToText(state.nagMode));
-
-    snprintf(v, sizeof(v), "%s / %lu", twaiStateToText(state.twaiState), (unsigned long)state.bBusoffCount);
-    drawRow(spr, 134, "TWAI/BusOff", v);
-}
-
-static void drawHzTile(TFT_eSprite& spr, int x, int y, const char* label, float hz)
-{
-    spr.fillRoundRect(x, y, 148, 76, 10, colPanel);
-    spr.drawRoundRect(x, y, 148, 76, 10, colAccent);
-    spr.drawRoundRect(x + 1, y + 1, 146, 74, 10, colTrack);
-
-    char hzBuf[16];
-    snprintf(hzBuf, sizeof(hzBuf), "%d", roundToInt(hz));
-
-    spr.setTextFont(2);
-    spr.setTextColor(colMuted, colPanel);
-    spr.setTextDatum(TL_DATUM);
-    spr.drawString(label, x + 10, y + 7);
-
-    spr.setTextFont(7);
-    spr.setTextColor(colHz, colPanel);
-    spr.setTextDatum(MC_DATUM);
-    spr.drawString(hzBuf, x + 74, y + 46);
-
-    spr.setTextFont(2);
-    spr.setTextDatum(TR_DATUM);
-    spr.setTextColor(colMuted, colPanel);
-    spr.drawString("Hz", x + 138, y + 7);
-}
-
-static void drawHzTiles(TFT_eSprite& spr, float hzA, float hzB)
-{
-    drawHzTile(spr, 8, 86, "A CH", hzA);
-    drawHzTile(spr, 164, 86, "B CH", hzB);
-}
-
-static void renderUi(const UiState& state)
-{
-    const uint32_t now = millis();
-    const bool showNoSignal = ((now / kNoSignalBlinkMs) % 2) == 0;
-
-    drawBackdrop(canvas);
-    if (gCurrentPage == 0) {
-        drawPageHeader(canvas, gCurrentPage, "MAIN");
-        drawMainPage(canvas, state);
-    } else if (gCurrentPage == 1) {
-        drawPageHeader(canvas, gCurrentPage, "A CHANNEL DETAIL");
-        drawAChannelPage(canvas, state);
+    const uint32_t current = (uint32_t)getCpuFrequencyMhz();
+    if (current <= 80) {
+        applyCpuProfile(160);
     } else {
-        drawPageHeader(canvas, gCurrentPage, "B CHANNEL DETAIL");
-        drawBChannelPage(canvas, state);
+        applyCpuProfile(80);
     }
-
-    if (!state.linked && showNoSignal) {
-        canvas.setTextFont(4);
-        canvas.setTextDatum(TC_DATUM);
-        canvas.setTextColor(TFT_BLACK, colBg);
-        canvas.drawString("NO SIGNAL", 161, 98);
-        canvas.setTextColor(colOff, colBg);
-        canvas.drawString("NO SIGNAL", 160, 97);
-    }
-
-    canvas.pushSprite(0, 0);
 }
 
-static bool needsRender(const UiState& a, const UiState& b)
+static UiRenderContext buildUiRenderContext()
 {
-    if (gCurrentPage > 2) return true;
-    if (a.linked != b.linked) return true;
-    if (a.nag != b.nag) return true;
-    if (a.eap != b.eap) return true;
-    if (a.nagMode != b.nagMode) return true;
-    if (a.twaiState != b.twaiState) return true;
-    if (a.echoCount != b.echoCount) return true;
-    if (a.txFailCount != b.txFailCount) return true;
-    if (a.aFramesTotal != b.aFramesTotal) return true;
-    if (a.aFrames1021 != b.aFrames1021) return true;
-    if (a.aEapModified != b.aEapModified) return true;
-    if (a.bFramesTotal != b.bFramesTotal) return true;
-    if (a.bFrames880 != b.bFrames880) return true;
-    if (a.bFrames921 != b.bFrames921) return true;
-    if (a.bBusoffCount != b.bBusoffCount) return true;
-    if ((a.hzA - b.hzA > 0.05f) || (b.hzA - a.hzA > 0.05f)) return true;
-    if ((a.hzB - b.hzB > 0.05f) || (b.hzB - a.hzB > 0.05f)) return true;
-    return false;
+    // 프레임마다 불변 컨텍스트 스냅샷 1개를 만듭니다.
+    // ui.cpp는 이 구조체만 읽도록 해서 렌더 코드와 런타임 전역 상태를 분리합니다.
+    UiRenderContext ctx;
+    ctx.currentPage = gCurrentPage;
+    ctx.pageCount = kPageCount;
+    ctx.brightnessPercent = gBrightnessPercent;
+    ctx.backlightLevel = gBacklightLevel;
+    ctx.systemSelected = gSystemSelected;
+    ctx.savedPageBeforeBrightness = gSavedPageBeforeBrightness;
+    ctx.brightnessAdjustMode = (gUiMode == UiMode::BrightnessAdjust);
+    ctx.systemEditMode = (gUiMode == UiMode::SystemEdit);
+    ctx.bluetoothRuntimeEnabled = gBluetoothRuntimeEnabled;
+    ctx.noSignalBlinkMs = kNoSignalBlinkMs;
+
+    bool wifiOn = gWifiRuntimeEnabled;
+#if ENABLE_WIFI_RADIO
+    wifiOn = gWifiRuntimeEnabled && (WiFi.getMode() != WIFI_OFF);
+#endif
+    ctx.wifiRuntimeEnabled = wifiOn;
+
+    ctx.colBg = colBg;
+    ctx.colPanel = colPanel;
+    ctx.colText = colText;
+    ctx.colMuted = colMuted;
+    ctx.colOn = colOn;
+    ctx.colOff = colOff;
+    ctx.colHz = colHz;
+    ctx.colAccent = colAccent;
+    ctx.colTrack = colTrack;
+    return ctx;
 }
 
 static bool handlePageButtons()
 {
+    // 입력 처리 전략:
+    // 1) 원시 입력 변화 감지, 2) 디바운스로 안정 엣지 확정,
+    // 3) 홀드/릴리즈 시간 기반 모드별 동작(페이지/시스템/밝기) 실행.
     const uint32_t now = millis();
-    const bool upNow = (digitalRead(kButtonUpPin) == HIGH);
-    const bool downNow = (digitalRead(kButtonDownPin) == HIGH);
+    const bool upRawNow = (digitalRead(kButtonUpPin) == LOW);
+    const bool downRawNow = (digitalRead(kButtonDownPin) == LOW);
 
-    // Keep one-step page changes per click to avoid jumpy transitions.
+    if (upRawNow != gUpRaw) {
+        gUpRaw = upRawNow;
+        gUpRawChangedMs = now;
+    }
+    if (downRawNow != gDownRaw) {
+        gDownRaw = downRawNow;
+        gDownRawChangedMs = now;
+    }
+
+    bool upPressedEdge = false;
+    bool upReleasedEdge = false;
+    bool downPressedEdge = false;
+    bool downReleasedEdge = false;
+
+    if ((now - gUpRawChangedMs >= kButtonDebounceMs) && (gUpStable != gUpRaw)) {
+        gUpStable = gUpRaw;
+        upPressedEdge = gUpStable;
+        upReleasedEdge = !gUpStable;
+        if (upPressedEdge) {
+            gUpPressedStartMs = now;
+            gUpRepeatMs = now;
+        }
+    }
+
+    if ((now - gDownRawChangedMs >= kButtonDebounceMs) && (gDownStable != gDownRaw)) {
+        gDownStable = gDownRaw;
+        downPressedEdge = gDownStable;
+        downReleasedEdge = !gDownStable;
+        if (downPressedEdge) {
+            gDownPressedStartMs = now;
+            gDownRepeatMs = now;
+        }
+    }
+
+    if (gUiMode == UiMode::BrightnessAdjust) {
+        bool changed = false;
+        if (upPressedEdge) {
+            gBrightnessUpHoldConsumed = false;
+            gBrightnessLastInputMs = now;
+        }
+
+        if (downPressedEdge) {
+            gBrightnessDownHoldConsumed = false;
+            gBrightnessLastInputMs = now;
+        }
+
+        if (gUpStable && (now - gUpPressedStartMs >= kBrightnessRepeatStartMs) &&
+            (now - gUpRepeatMs >= kBrightnessRepeatIntervalMs)) {
+            if (gBrightnessPercent <= (uint8_t)(100 - kBrightnessStepPercent)) {
+                applyBacklightPercent((uint8_t)(gBrightnessPercent + kBrightnessStepPercent));
+            }
+            gUpRepeatMs = now;
+            gBrightnessUpHoldConsumed = true;
+            gBrightnessLastInputMs = now;
+            gPageDirty = true;
+            changed = true;
+        }
+
+        if (gDownStable && (now - gDownPressedStartMs >= kBrightnessRepeatStartMs) &&
+            (now - gDownRepeatMs >= kBrightnessRepeatIntervalMs)) {
+            if (gBrightnessPercent >= kBrightnessStepPercent) {
+                applyBacklightPercent((uint8_t)(gBrightnessPercent - kBrightnessStepPercent));
+            }
+            gDownRepeatMs = now;
+            gBrightnessDownHoldConsumed = true;
+            gBrightnessLastInputMs = now;
+            gPageDirty = true;
+            changed = true;
+        }
+
+        if (upReleasedEdge) {
+            if (!gBrightnessUpHoldConsumed && gBrightnessPercent <= (uint8_t)(100 - kBrightnessStepPercent)) {
+                applyBacklightPercent((uint8_t)(gBrightnessPercent + kBrightnessStepPercent));
+                gBrightnessLastInputMs = now;
+                gPageDirty = true;
+                changed = true;
+            }
+            gBrightnessUpHoldConsumed = false;
+        }
+
+        if (downReleasedEdge) {
+            if (!gBrightnessDownHoldConsumed && gBrightnessPercent >= kBrightnessStepPercent) {
+                applyBacklightPercent((uint8_t)(gBrightnessPercent - kBrightnessStepPercent));
+                gBrightnessLastInputMs = now;
+                gPageDirty = true;
+                changed = true;
+            }
+            gBrightnessDownHoldConsumed = false;
+        }
+
+        if (now - gBrightnessLastInputMs >= kBrightnessIdleSaveMs) {
+            saveBrightnessPercent(gBrightnessPercent);
+            gUiMode = UiMode::PageView;
+            gCurrentPage = gSavedPageBeforeBrightness;
+            gPageDirty = true;
+            gLongPressConsumed = true;
+            changed = true;
+        }
+        return changed;
+    }
+
+    if (gUiMode == UiMode::SystemEdit) {
+        bool changed = false;
+
+        if (upReleasedEdge && !gSystemUpExecConsumed) {
+            gSystemSelected = (uint8_t)((gSystemSelected + kSystemItemCount - 1) % kSystemItemCount);
+            gPageDirty = true;
+            changed = true;
+        }
+        if (downReleasedEdge && !gSystemDownExitConsumed) {
+            gSystemSelected = (uint8_t)((gSystemSelected + 1) % kSystemItemCount);
+            gPageDirty = true;
+            changed = true;
+        }
+
+        if (gUpStable && !gSystemUpExecConsumed && (now - gUpPressedStartMs >= kSystemEditExecHoldMs)) {
+            const SystemItem item = (SystemItem)gSystemSelected;
+            if (item == SystemItem::CpuProfile) {
+                cycleCpuProfile();
+            } else if (item == SystemItem::WifiRuntime) {
+#if ENABLE_WIFI_RADIO
+                if (!gWifiRuntimeEnabled || WiFi.getMode() == WIFI_OFF) {
+                    if (initEspNowReceiver()) {
+                        gWifiRuntimeEnabled = true;
+                        saveWifiRuntimeEnabled(true);
+                    }
+                } else {
+                    esp_now_deinit();
+                    WiFi.mode(WIFI_OFF);
+                    gWifiRuntimeEnabled = false;
+                    saveWifiRuntimeEnabled(false);
+                    Serial.println("[SYS] WiFi runtime -> OFF");
+                }
+#endif
+            } else if (item == SystemItem::BluetoothBuild) {
+#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
+                if (gBluetoothRuntimeEnabled) {
+                    if (btStarted()) {
+                        btStop();
+                    }
+                    gBluetoothRuntimeEnabled = false;
+                    saveBluetoothRuntimeEnabled(false);
+                    Serial.println("[SYS] Bluetooth runtime -> OFF");
+                } else {
+                    if (!btStarted()) {
+                        btStart();
+                    }
+                    gBluetoothRuntimeEnabled = true;
+                    saveBluetoothRuntimeEnabled(true);
+                    Serial.println("[SYS] Bluetooth runtime -> ON");
+                }
+                applyWifiBtCoexistPolicy();
+#endif
+            } else if (item == SystemItem::BrightnessQuick) {
+                gSavedPageBeforeBrightness = gCurrentPage;
+                gUiMode = UiMode::BrightnessAdjust;
+                gBrightnessUpHoldConsumed = false;
+                gBrightnessDownHoldConsumed = false;
+                gBrightnessLastInputMs = now;
+            }
+            gSystemUpExecConsumed = true;
+            gPageDirty = true;
+            changed = true;
+        }
+
+        if (gDownStable && !gSystemDownExitConsumed && (now - gDownPressedStartMs >= kSystemEditExitHoldMs)) {
+            gUiMode = UiMode::PageView;
+            gSystemDownExitConsumed = true;
+            gPageDirty = true;
+            changed = true;
+        }
+
+        if (upReleasedEdge) gSystemUpExecConsumed = false;
+        if (downReleasedEdge) gSystemDownExitConsumed = false;
+        return changed;
+    }
+
+    if (gCurrentPage == 3 && gDownStable && !gSystemDownExitConsumed && (now - gDownPressedStartMs >= kSystemEditEnterHoldMs)) {
+        gUiMode = UiMode::SystemEdit;
+        gSystemSelected = 0;
+        gSystemUpExecConsumed = false;
+        gSystemDownExitConsumed = true;
+        gPageDirty = true;
+        return true;
+    }
+
+    if (gUpStable) {
+        if (upPressedEdge) {
+            gLongPressConsumed = false;
+        } else if (!gLongPressConsumed && (now - gUpPressedStartMs >= kBrightnessEnterHoldMs)) {
+            gSavedPageBeforeBrightness = gCurrentPage;
+            gUiMode = UiMode::BrightnessAdjust;
+            gBrightnessUpHoldConsumed = false;
+            gBrightnessDownHoldConsumed = false;
+            gBrightnessLastInputMs = now;
+            gPageDirty = true;
+            gLongPressConsumed = true;
+            return true;
+        }
+    }
+
+    // 클릭 1회당 페이지 1단계만 이동시켜 과도한 점프를 방지합니다.
     if (now - gLastPageChangeMs < kPageButtonMinIntervalMs) {
-        gPrevBtnUp = upNow;
-        gPrevBtnDown = downNow;
         return false;
     }
 
     bool changed = false;
 
-    if (gPrevBtnDown && !downNow) {
-        gCurrentPage = (uint8_t)((gCurrentPage + 1) % 3);
+    if (downReleasedEdge) {
+        gCurrentPage = (uint8_t)((gCurrentPage + 1) % kPageCount);
         gPageDirty = true;
         changed = true;
-    } else if (gPrevBtnUp && !upNow) {
-        gCurrentPage = (uint8_t)((gCurrentPage + 2) % 3);
+    } else if (!gLongPressConsumed && upReleasedEdge) {
+        gCurrentPage = (uint8_t)((gCurrentPage + kPageCount - 1) % kPageCount);
         gPageDirty = true;
         changed = true;
     }
 
     if (changed) gLastPageChangeMs = now;
+    if (!gUpStable) gLongPressConsumed = false;
+    if (!gDownStable) gSystemDownExitConsumed = false;
 
-    gPrevBtnUp = upNow;
-    gPrevBtnDown = downNow;
+    (void)upReleasedEdge;
+    (void)downReleasedEdge;
     return changed;
 }
 
 static bool initEspNowReceiver()
 {
+#if !ENABLE_WIFI_RADIO
+    Serial.println("[ESP-NOW] disabled by ENABLE_WIFI_RADIO=0");
+    return false;
+#else
     WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    delay(50);
+    applyWifiBtCoexistPolicy();
 
-    // Force fixed channel for reliable sender/receiver pairing.
-    // Some boards apply channel changes more reliably with a brief promiscuous toggle.
+    // 송신기/수신기 안정 페어링을 위해 WiFi 채널을 고정합니다.
+    // 일부 보드는 promiscuous 토글을 거쳐야 채널 적용이 더 안정적입니다.
     esp_wifi_set_promiscuous(true);
     esp_err_t chRet = esp_wifi_set_channel(kWifiChannel, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous(false);
@@ -400,6 +676,7 @@ static bool initEspNowReceiver()
             parsed.echo_count = legacy.echo_count;
             parsed.tx_fail_count = legacy.tx_fail_count;
         } else {
+            gBadLengthPacketCount++;
             return;
         }
 
@@ -408,6 +685,7 @@ static bool initEspNowReceiver()
         gLatestMsg = parsed;
         gHasData = true;
         gLastRxMs = millis();
+        gRxPacketCount++;
         if (info && info->src_addr) memcpy(gLastSenderMac, info->src_addr, 6);
         portEXIT_CRITICAL_ISR(&gDataMux);
 
@@ -436,6 +714,7 @@ static bool initEspNowReceiver()
             parsed.echo_count = legacy.echo_count;
             parsed.tx_fail_count = legacy.tx_fail_count;
         } else {
+            gBadLengthPacketCount++;
             return;
         }
 
@@ -444,6 +723,7 @@ static bool initEspNowReceiver()
         gLatestMsg = parsed;
         gHasData = true;
         gLastRxMs = millis();
+        gRxPacketCount++;
         if (mac) memcpy(gLastSenderMac, mac, 6);
         portEXIT_CRITICAL_ISR(&gDataMux);
 
@@ -457,20 +737,71 @@ static bool initEspNowReceiver()
 
     Serial.println("[ESP-NOW] receiver ready");
     return true;
+#endif
+}
+
+static void ensureReceiverChannel()
+{
+#if ENABLE_WIFI_RADIO
+    const uint32_t now = millis();
+    if (now - gLastChannelCheckMs < kChannelCheckIntervalMs) return;
+    gLastChannelCheckMs = now;
+
+    uint8_t primary = 0;
+    wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+    if (esp_wifi_get_channel(&primary, &second) != ESP_OK) return;
+    if (primary == kWifiChannel) return;
+
+    Serial.printf("[ESP-NOW] channel drift detected: %u -> %u\n", (unsigned)primary, (unsigned)kWifiChannel);
+    esp_wifi_set_promiscuous(true);
+    esp_err_t chRet = esp_wifi_set_channel(kWifiChannel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+    if (chRet != ESP_OK) {
+        Serial.printf("[ESP-NOW] channel restore failed: %d\n", (int)chRet);
+    } else {
+        Serial.println("[ESP-NOW] channel restored");
+    }
+#endif
 }
 
 void setup()
 {
+    // 1) 무선/화면 초기화 전에 저장된 런타임 설정을 먼저 복원합니다.
     Serial.begin(115200);
-    delay(300);
+
+    loadRuntimeSettings();
+
+#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
+    if (gBluetoothRuntimeEnabled) {
+        if (!btStarted()) {
+            btStart();
+        }
+    } else {
+        if (btStarted()) {
+            btStop();
+        }
+    }
+#endif
+
+    if (getCpuFrequencyMhz() != gCpuTargetMhz) {
+        setCpuFrequencyMhz(gCpuTargetMhz);
+    }
+    Serial.printf("[SYS] CPU %u MHz (target=%u)\n", (unsigned)getCpuFrequencyMhz(), (unsigned)gCpuTargetMhz);
 
     pinMode(15, OUTPUT);
     digitalWrite(15, HIGH);
 
     pinMode(kButtonUpPin, INPUT_PULLUP);
     pinMode(kButtonDownPin, INPUT_PULLUP);
-    gPrevBtnUp = (digitalRead(kButtonUpPin) == HIGH);
-    gPrevBtnDown = (digitalRead(kButtonDownPin) == HIGH);
+    gUpRaw = (digitalRead(kButtonUpPin) == LOW);
+    gDownRaw = (digitalRead(kButtonDownPin) == LOW);
+    gUpStable = gUpRaw;
+    gDownStable = gDownRaw;
+    gUpRawChangedMs = millis();
+    gDownRawChangedMs = millis();
+
+    pinMode(kBacklightPin, OUTPUT);
+    applyBacklightPercent(loadBrightnessPercent(gBrightnessPercent));
 
     tft.init();
     tft.setRotation(1);
@@ -492,20 +823,27 @@ void setup()
 
     UiState boot;
     boot.linked = false;
-    renderUi(boot);
+    // 부팅 직후 초기 화면을 즉시 그려 사용자에게 확정된 상태를 보여줍니다.
+    uiRender(canvas, boot, buildUiRenderContext());
 
-    initEspNowReceiver();
+    if (gWifiRuntimeEnabled) {
+        initEspNowReceiver();
+    } else {
+        Serial.println("[ESP-NOW] skipped by persisted runtime setting");
+    }
 }
 
 void loop()
 {
     static uint32_t lastRenderMs = 0;
 
-    handlePageButtons();
+    // 홀드/릴리즈 타이밍 정확도를 위해 버튼은 매 loop마다 폴링합니다.
+    const bool buttonChanged = handlePageButtons();
+    ensureReceiverChannel();
 
     uint32_t now = millis();
-    if (now - lastRenderMs < kRenderIntervalMs) {
-        delay(5);
+    const uint32_t renderInterval = (gUiMode == UiMode::BrightnessAdjust) ? 33 : kRenderIntervalMs;
+    if (now - lastRenderMs < renderInterval) {
         return;
     }
     lastRenderMs = now;
@@ -520,8 +858,9 @@ void loop()
     lastRx = gLastRxMs;
     portEXIT_CRITICAL(&gDataMux);
 
+    // 최신 수신 패킷 스냅샷으로 다음 프레임 상태를 구성합니다.
     UiState next;
-    next.uptime = msg.uptime;
+    next.uptime = now / 1000u;
     next.hzA = msg.hz_a;
     next.hzB = msg.hz_b;
     next.nag = msg.nag_active;
@@ -537,15 +876,42 @@ void loop()
     next.bFrames880 = msg.b_frames_880;
     next.bFrames921 = msg.b_frames_921;
     next.bBusoffCount = msg.b_busoff_count;
-    next.linked = hasData && (now - lastRx <= kLinkTimeoutMs);
+
+    // RF 지터로 생기는 짧은 패킷 공백에서 오탐(NO SIGNAL) 방지를 위해 디바운스를 둡니다.
+    const bool linkFresh = hasData && (now - lastRx <= kLinkTimeoutMs);
+    if (linkFresh) {
+        gLinkMissStreak = 0;
+        next.linked = true;
+    } else {
+        if (gLinkMissStreak < 255) gLinkMissStreak++;
+        next.linked = (gLinkMissStreak < kLinkMissDebounceFrames);
+    }
+
+    if (next.linked != gPrevLinked) {
+        if (next.linked) {
+            Serial.printf("[LINK] reconnected. rx_pkts=%lu bad_len=%lu tx_fail=%lu\n",
+                          (unsigned long)gRxPacketCount,
+                          (unsigned long)gBadLengthPacketCount,
+                          (unsigned long)next.txFailCount);
+        } else {
+            const uint32_t age = hasData ? (now - lastRx) : 0;
+            Serial.printf("[LINK] lost. age=%lums rx_pkts=%lu bad_len=%lu last_tx_fail=%lu\n",
+                          (unsigned long)age,
+                          (unsigned long)gRxPacketCount,
+                          (unsigned long)gBadLengthPacketCount,
+                          (unsigned long)next.txFailCount);
+        }
+        gPrevLinked = next.linked;
+    }
 
     if (!next.linked && now > kLinkTimeoutMs) {
         next.hzA = 0.0f;
         next.hzB = 0.0f;
     }
 
-    if (gPageDirty || needsRender(gShown, next) || !next.linked) {
-        renderUi(next);
+    // 버튼 이벤트가 있거나 화면 데이터가 바뀐 경우에만 렌더링합니다.
+    if (buttonChanged || gPageDirty || (gUiMode == UiMode::BrightnessAdjust) || uiNeedsRender(gShown, next, gCurrentPage, kPageCount) || !next.linked) {
+        uiRender(canvas, next, buildUiRenderContext());
         gShown = next;
         gPageDirty = false;
     }

@@ -43,6 +43,7 @@ For display/no-signal issues, follow this order:
 - Keep changes surgical. No unrelated refactor.
 - Prefer constants in one mapping header; avoid pin literals scattered in code.
 - Add a short rationale comment only when logic is non-obvious.
+- Write all newly added code comments in Korean by default. Keep them concise and beginner-friendly.
 - Preserve runtime diagnostics that help field troubleshooting.
 - For communication failures, add one focused observable log first, then patch.
 
