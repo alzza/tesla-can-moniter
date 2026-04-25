@@ -7,6 +7,7 @@ namespace {
 
 // 이 파일 내부에서만 사용하는 상수입니다.
 static constexpr uint8_t kNagModeFixed = 1;
+static const char* kNagStrategyText = "CTR+1 FIXED";
 
 static const char* nagModeToText(uint8_t mode)
 {
@@ -34,6 +35,12 @@ static const char* btStatusText(const UiRenderContext& ctx)
 static int roundToInt(float v)
 {
     return (int)lroundf(v);
+}
+
+static void formatTorqueNm(char* out, size_t outLen, float torqueNm)
+{
+    const float shownTorque = (fabsf(torqueNm) < 0.005f) ? 0.0f : torqueNm;
+    snprintf(out, outLen, "%.2fNm", (double)shownTorque);
 }
 
 // 배경 레이어: 이전 프레임을 지우고 양쪽 고정 가이드 라인을 그립니다.
@@ -141,39 +148,58 @@ static void drawMainPage(TFT_eSprite& spr, const UiRenderContext& ctx, const UiS
 {
     drawStatusTiles(spr, ctx, state.nag, state.eap);
 
-    // A/B Hz 타일 모양을 동일하게 유지하기 위한 로컬 헬퍼입니다.
-    auto drawHzTile = [&](int x, int y, const char* label, float hz) {
+    // 메인 화면은 B채널 핵심값 2개(Frame Rate / Torque)만 빠르게 보이도록 구성합니다.
+    auto drawMetricTile = [&](int x, int y, const char* label, const char* value, const char* unit, uint8_t valueFont, uint16_t valueColor) {
         spr.fillRoundRect(x, y, 148, 76, 10, ctx.colPanel);
         spr.drawRoundRect(x, y, 148, 76, 10, ctx.colAccent);
         spr.drawRoundRect(x + 1, y + 1, 146, 74, 10, ctx.colTrack);
-
-        char hzBuf[16];
-        snprintf(hzBuf, sizeof(hzBuf), "%d", roundToInt(hz));
 
         spr.setTextFont(2);
         spr.setTextColor(ctx.colMuted, ctx.colPanel);
         spr.setTextDatum(TL_DATUM);
         spr.drawString(label, x + 10, y + 7);
 
-        spr.setTextFont(7);
-        spr.setTextColor(ctx.colHz, ctx.colPanel);
+        spr.setTextFont(valueFont);
+        spr.setTextColor(valueColor, ctx.colPanel);
         spr.setTextDatum(MC_DATUM);
-        spr.drawString(hzBuf, x + 74, y + 46);
+        spr.drawString(value, x + 74, y + 46);
 
-        spr.setTextFont(2);
-        spr.setTextDatum(TR_DATUM);
-        spr.setTextColor(ctx.colMuted, ctx.colPanel);
-        spr.drawString("Hz", x + 138, y + 7);
+        if (unit && unit[0]) {
+            spr.setTextFont(2);
+            spr.setTextDatum(TR_DATUM);
+            spr.setTextColor(ctx.colMuted, ctx.colPanel);
+            spr.drawString(unit, x + 138, y + 7);
+        }
     };
 
-    drawHzTile(8, 86, "A CH", state.hzA);
-    drawHzTile(164, 86, "B CH", state.hzB);
+    char bHzBuf[16];
+    snprintf(bHzBuf, sizeof(bHzBuf), "%d", roundToInt(state.hzB));
+    drawMetricTile(8, 86, "B RATE", bHzBuf, "Hz", 7, ctx.colHz);
+
+    char torqueBuf[20];
+    formatTorqueNm(torqueBuf, sizeof(torqueBuf), state.torqueNm);
+    drawMetricTile(164, 86, "TORQUE", torqueBuf, "", 4, ctx.colText);
+
+    char stealthBuf[24];
+    if (state.stealthTorqueNm > 0.0f) {
+        formatTorqueNm(stealthBuf, sizeof(stealthBuf), state.stealthTorqueNm);
+    } else {
+        snprintf(stealthBuf, sizeof(stealthBuf), "--");
+    }
+
+    spr.setTextFont(2);
+    spr.setTextDatum(TL_DATUM);
+    spr.setTextColor(ctx.colMuted, ctx.colPanel);
+    spr.drawString("STEALTH", 174, 141);
+    spr.setTextDatum(TR_DATUM);
+    spr.setTextColor(state.stealthTorqueNm > 0.0f ? ctx.colHz : ctx.colMuted, ctx.colPanel);
+    spr.drawString(stealthBuf, 302, 141);
 
     spr.fillRoundRect(164, 66, 148, 16, 5, ctx.colPanel);
     spr.setTextFont(2);
     spr.setTextDatum(MC_DATUM);
     spr.setTextColor(ctx.colMuted, ctx.colPanel);
-    spr.drawString(nagModeToText(state.nagMode), 238, 74);
+    spr.drawString(kNagStrategyText, 238, 74);
 }
 
 static void drawRow(TFT_eSprite& spr, const UiRenderContext& ctx, int y, const char* key, const char* value)
@@ -218,13 +244,13 @@ static void drawBChannelPage(TFT_eSprite& spr, const UiRenderContext& ctx, const
     snprintf(v, sizeof(v), "%lu", (unsigned long)state.bFramesTotal);
     drawRow(spr, ctx, 54, "B Frames Total", v);
 
-    snprintf(v, sizeof(v), "%lu / %lu", (unsigned long)state.bFrames880, (unsigned long)state.bFrames921);
-    drawRow(spr, ctx, 74, "B ID 880/921", v);
+    snprintf(v, sizeof(v), "%lu", (unsigned long)state.bFrames880);
+    drawRow(spr, ctx, 74, "B ID 880", v);
 
     snprintf(v, sizeof(v), "%lu", (unsigned long)state.echoCount);
     drawRow(spr, ctx, 94, "B Echo Count", v);
 
-    drawRow(spr, ctx, 114, "Nag Mode", nagModeToText(state.nagMode));
+    drawRow(spr, ctx, 114, "Nag Path", kNagStrategyText);
 
     snprintf(v, sizeof(v), "%s / %lu", twaiStateToText(state.twaiState), (unsigned long)state.bBusoffCount);
     drawRow(spr, ctx, 134, "TWAI/BusOff", v);
@@ -330,6 +356,8 @@ bool uiNeedsRender(const UiState& a, const UiState& b, uint8_t currentPage, uint
     if (a.eap != b.eap) return true;
     if (a.nagMode != b.nagMode) return true;
     if (a.twaiState != b.twaiState) return true;
+    if ((a.torqueNm - b.torqueNm > 0.01f) || (b.torqueNm - a.torqueNm > 0.01f)) return true;
+    if ((a.stealthTorqueNm - b.stealthTorqueNm > 0.01f) || (b.stealthTorqueNm - a.stealthTorqueNm > 0.01f)) return true;
     if (a.echoCount != b.echoCount) return true;
     if (a.txFailCount != b.txFailCount) return true;
     if (a.aFramesTotal != b.aFramesTotal) return true;

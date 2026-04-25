@@ -46,9 +46,11 @@ struct __attribute__((packed)) struct_message {
     uint32_t b_frames_880;
     uint32_t b_frames_921;
     uint32_t b_busoff_count;
+    float torque_nm;
+    float stealth_torque_nm;
 };
 
-static_assert(sizeof(struct_message) == 52, "struct_message size mismatch");
+static_assert(sizeof(struct_message) == 60, "struct_message size mismatch");
 
 struct __attribute__((packed)) legacy_message {
     uint32_t uptime;
@@ -61,6 +63,39 @@ struct __attribute__((packed)) legacy_message {
 };
 
 static_assert(sizeof(legacy_message) == 22, "legacy_message size mismatch");
+
+static constexpr int kTelemetryPacketCompatSize = 52;
+
+static bool decodeTelemetryPacket(struct_message& parsed, const uint8_t* data, int len)
+{
+    parsed = {};
+
+    // 새 필드는 항상 뒤에만 추가하는 전제로, 앞부분 prefix만 복사해 호환성을 유지합니다.
+    if (len >= kTelemetryPacketCompatSize) {
+        const size_t copyLen = (len >= (int)sizeof(struct_message))
+            ? sizeof(struct_message)
+            : (size_t)len;
+        memcpy(&parsed, data, copyLen);
+        return true;
+    }
+
+    if (len == (int)sizeof(legacy_message)) {
+        legacy_message legacy = {};
+        memcpy(&legacy, data, sizeof(legacy));
+        parsed.uptime = legacy.uptime;
+        parsed.hz_a = legacy.hz_a;
+        parsed.hz_b = legacy.hz_b;
+        parsed.nag_active = legacy.nag_active;
+        parsed.eap_active = legacy.eap_active;
+        parsed.nag_mode = 1;
+        parsed.twai_state = 0;
+        parsed.echo_count = legacy.echo_count;
+        parsed.tx_fail_count = legacy.tx_fail_count;
+        return true;
+    }
+
+    return false;
+}
 
 static TFT_eSPI tft;
 static TFT_eSprite canvas = TFT_eSprite(&tft);
@@ -324,17 +359,12 @@ static void applyWifiBtCoexistPolicy()
 {
 #if ENABLE_WIFI_RADIO
     if (WiFi.getMode() == WIFI_OFF) return;
-#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
-    if (gBluetoothRuntimeEnabled) {
-        WiFi.setSleep(true);
-        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-        Serial.println("[SYS] Coexist: WiFi modem sleep ON (BT enabled)");
-        return;
-    }
-#endif
+
+    // ESP-NOW 수신기는 연속 수신 감도가 중요하므로, BT 런타임이 켜져 있어도
+    // WiFi modem sleep은 사용하지 않습니다.
     WiFi.setSleep(false);
     esp_wifi_set_ps(WIFI_PS_NONE);
-    Serial.println("[SYS] Coexist: WiFi modem sleep OFF");
+    Serial.println("[SYS] Coexist: WiFi modem sleep OFF (ESP-NOW priority)");
 #endif
 }
 
@@ -638,6 +668,17 @@ static bool initEspNowReceiver()
     Serial.println("[ESP-NOW] disabled by ENABLE_WIFI_RADIO=0");
     return false;
 #else
+#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
+    if (gBluetoothRuntimeEnabled) {
+        if (btStarted()) {
+            btStop();
+        }
+        gBluetoothRuntimeEnabled = false;
+        saveBluetoothRuntimeEnabled(false);
+        Serial.println("[SYS] Bluetooth runtime -> OFF (ESP-NOW priority)");
+    }
+#endif
+
     WiFi.mode(WIFI_STA);
     applyWifiBtCoexistPolicy();
 
@@ -661,21 +702,7 @@ static bool initEspNowReceiver()
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
     esp_now_register_recv_cb([](const esp_now_recv_info_t* info, const uint8_t* data, int len) {
         struct_message parsed = {};
-        if (len == (int)sizeof(struct_message)) {
-            memcpy(&parsed, data, sizeof(parsed));
-        } else if (len == (int)sizeof(legacy_message)) {
-            legacy_message legacy = {};
-            memcpy(&legacy, data, sizeof(legacy));
-            parsed.uptime = legacy.uptime;
-            parsed.hz_a = legacy.hz_a;
-            parsed.hz_b = legacy.hz_b;
-            parsed.nag_active = legacy.nag_active;
-            parsed.eap_active = legacy.eap_active;
-            parsed.nag_mode = kNagModeDynamic;
-            parsed.twai_state = 0;
-            parsed.echo_count = legacy.echo_count;
-            parsed.tx_fail_count = legacy.tx_fail_count;
-        } else {
+        if (!decodeTelemetryPacket(parsed, data, len)) {
             gBadLengthPacketCount++;
             return;
         }
@@ -699,21 +726,7 @@ static bool initEspNowReceiver()
 #else
     esp_now_register_recv_cb([](const uint8_t* mac, const uint8_t* data, int len) {
         struct_message parsed = {};
-        if (len == (int)sizeof(struct_message)) {
-            memcpy(&parsed, data, sizeof(parsed));
-        } else if (len == (int)sizeof(legacy_message)) {
-            legacy_message legacy = {};
-            memcpy(&legacy, data, sizeof(legacy));
-            parsed.uptime = legacy.uptime;
-            parsed.hz_a = legacy.hz_a;
-            parsed.hz_b = legacy.hz_b;
-            parsed.nag_active = legacy.nag_active;
-            parsed.eap_active = legacy.eap_active;
-            parsed.nag_mode = kNagModeDynamic;
-            parsed.twai_state = 0;
-            parsed.echo_count = legacy.echo_count;
-            parsed.tx_fail_count = legacy.tx_fail_count;
-        } else {
+        if (!decodeTelemetryPacket(parsed, data, len)) {
             gBadLengthPacketCount++;
             return;
         }
@@ -876,12 +889,18 @@ void loop()
     next.bFrames880 = msg.b_frames_880;
     next.bFrames921 = msg.b_frames_921;
     next.bBusoffCount = msg.b_busoff_count;
+    next.torqueNm = msg.torque_nm;
+    next.stealthTorqueNm = msg.stealth_torque_nm;
 
     // RF 지터로 생기는 짧은 패킷 공백에서 오탐(NO SIGNAL) 방지를 위해 디바운스를 둡니다.
+    // 단, 유효 패킷을 한 번도 못 받은 부팅 초기에는 링크로 간주하지 않습니다.
     const bool linkFresh = hasData && (now - lastRx <= kLinkTimeoutMs);
     if (linkFresh) {
         gLinkMissStreak = 0;
         next.linked = true;
+    } else if (!hasData) {
+        gLinkMissStreak = kLinkMissDebounceFrames;
+        next.linked = false;
     } else {
         if (gLinkMissStreak < 255) gLinkMissStreak++;
         next.linked = (gLinkMissStreak < kLinkMissDebounceFrames);
@@ -907,6 +926,8 @@ void loop()
     if (!next.linked && now > kLinkTimeoutMs) {
         next.hzA = 0.0f;
         next.hzB = 0.0f;
+        next.torqueNm = 0.0f;
+        next.stealthTorqueNm = 0.0f;
     }
 
     // 버튼 이벤트가 있거나 화면 데이터가 바뀐 경우에만 렌더링합니다.

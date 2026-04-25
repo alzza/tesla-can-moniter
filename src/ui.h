@@ -28,6 +28,8 @@ struct UiState {
     uint32_t bFrames880 = 0;
     uint32_t bFrames921 = 0;
     uint32_t bBusoffCount = 0;
+    float torqueNm = 0.0f;
+    float stealthTorqueNm = 0.0f;
     // 수신 링크 연결 상태(main loop에서 계산).
     bool linked = false;
 };
