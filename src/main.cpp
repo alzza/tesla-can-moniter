@@ -20,117 +20,49 @@
 
 #if ENABLE_WIFI_RADIO
 #include <WiFi.h>
-#include <esp_wifi.h>
-#include <esp_now.h>
+#include <HTTPClient.h>
+#include <cJSON.h>
 #endif
-
-struct __attribute__((packed)) struct_message {
-    // 송신기 업타임(초)
-    uint32_t uptime;
-    // 메인 A/B 채널 주기
-    float hz_a;
-    float hz_b;
-    // 기능 활성 상태 플래그
-    bool nag_active;
-    bool eap_active;
-    // 모드/상태 값(신규 페이로드 포맷)
-    uint8_t nag_mode;
-    uint8_t twai_state;
-    // 진단 카운터
-    uint32_t echo_count;
-    uint32_t tx_fail_count;
-    uint32_t a_frames_total;
-    uint32_t a_frames_1021;
-    uint32_t a_eap_modified;
-    uint32_t b_frames_total;
-    uint32_t b_frames_880;
-    uint32_t b_frames_921;
-    uint32_t b_busoff_count;
-    float torque_nm;
-    float stealth_torque_nm;
-};
-
-static_assert(sizeof(struct_message) == 60, "struct_message size mismatch");
-
-struct __attribute__((packed)) legacy_message {
-    uint32_t uptime;
-    float hz_a;
-    float hz_b;
-    bool nag_active;
-    bool eap_active;
-    uint32_t echo_count;
-    uint32_t tx_fail_count;
-};
-
-static_assert(sizeof(legacy_message) == 22, "legacy_message size mismatch");
-
-static constexpr int kTelemetryPacketCompatSize = 52;
-
-static bool decodeTelemetryPacket(struct_message& parsed, const uint8_t* data, int len)
-{
-    parsed = {};
-
-    // 새 필드는 항상 뒤에만 추가하는 전제로, 앞부분 prefix만 복사해 호환성을 유지합니다.
-    if (len >= kTelemetryPacketCompatSize) {
-        const size_t copyLen = (len >= (int)sizeof(struct_message))
-            ? sizeof(struct_message)
-            : (size_t)len;
-        memcpy(&parsed, data, copyLen);
-        return true;
-    }
-
-    if (len == (int)sizeof(legacy_message)) {
-        legacy_message legacy = {};
-        memcpy(&legacy, data, sizeof(legacy));
-        parsed.uptime = legacy.uptime;
-        parsed.hz_a = legacy.hz_a;
-        parsed.hz_b = legacy.hz_b;
-        parsed.nag_active = legacy.nag_active;
-        parsed.eap_active = legacy.eap_active;
-        parsed.nag_mode = 1;
-        parsed.twai_state = 0;
-        parsed.echo_count = legacy.echo_count;
-        parsed.tx_fail_count = legacy.tx_fail_count;
-        return true;
-    }
-
-    return false;
-}
 
 static TFT_eSPI tft;
 static TFT_eSprite canvas = TFT_eSprite(&tft);
 
 static portMUX_TYPE gDataMux = portMUX_INITIALIZER_UNLOCKED;
-static struct_message gLatestMsg = {};
+static UiState gLatestState = {};
 static bool gHasData = false;
 static uint32_t gLastRxMs = 0;
-static uint8_t gLastSenderMac[6] = {0}; 
-static uint32_t gRxPacketCount = 0;
-static uint32_t gBadLengthPacketCount = 0;
+static uint32_t gRequestOkCount = 0;
+static uint32_t gRequestFailCount = 0;
+static uint32_t gParseFailCount = 0;
+static uint32_t gLastRequestMs = 0;
+static uint32_t gLastReconnectMs = 0;
 
 static UiState gShown = {};
 
-static constexpr uint8_t kWifiChannel = 1;
+static constexpr char kT2CanSsid[] = "TeslaCAN";
+static constexpr char kT2CanPassword[] = "asdf1234";
+static constexpr char kMonitorUrl[] = "http://192.168.4.1/api/monitor";
+static constexpr uint32_t kMonitorSchema = 1;
+static constexpr uint32_t kMonitorPollMs = 1000;
+static constexpr uint32_t kWifiReconnectMs = 2000;
 static constexpr uint32_t kRenderIntervalMs = 100;
 static constexpr uint32_t kLinkTimeoutMs = 3200;
 static constexpr uint32_t kNoSignalBlinkMs = 450;
-static constexpr uint32_t kChannelCheckIntervalMs = 3000;
 static constexpr uint32_t kPageButtonMinIntervalMs = 140;
-static constexpr uint8_t kLinkMissDebounceFrames = 4;
 static constexpr uint8_t kButtonUpPin = 14;
 static constexpr uint8_t kButtonDownPin = 0;
 static constexpr uint8_t kBacklightPin = 38;
 static constexpr uint8_t kBrightnessStepPercent = 10;
 static constexpr uint32_t kBrightnessEnterHoldMs = 3000;
+static constexpr uint32_t kThemeToggleHoldMs = 3000;
+static constexpr uint32_t kThemeToastMs = 800;
 static constexpr uint32_t kBrightnessIdleSaveMs = 3000;
 static constexpr uint32_t kButtonDebounceMs = 30;
 static constexpr uint32_t kBrightnessRepeatStartMs = 400;
 static constexpr uint32_t kBrightnessRepeatIntervalMs = 120;
 static constexpr uint8_t kBacklightLevelMax = 16;
 static constexpr uint8_t kBacklightLevelMin = 1;
-static constexpr uint8_t kNagModeDynamic = 0;
-static constexpr uint8_t kNagModeFixed = 1;
-static constexpr uint8_t kPageCount = 4;
+static constexpr uint8_t kPageCount = 5;
 
 enum class UiMode : uint8_t {
     PageView = 0,
@@ -140,24 +72,19 @@ enum class UiMode : uint8_t {
 
 enum class SystemItem : uint8_t {
     CpuProfile = 0,
-    WifiRuntime = 1,
-    BluetoothBuild = 2,
-    BrightnessQuick = 3,
+    BrightnessQuick = 1,
+    Theme = 2,
 };
 
-static constexpr uint8_t kSystemItemCount = 4;
+static constexpr uint8_t kSystemItemCount = 3;
 static constexpr uint32_t kSystemEditEnterHoldMs = 2000;
 static constexpr uint32_t kSystemEditExecHoldMs = 1000;
 static constexpr uint32_t kSystemEditExitHoldMs = 1500;
 
 static uint8_t gCurrentPage = 0;
-static bool gPrevBtnUp = true;
-static bool gPrevBtnDown = true;
 static uint32_t gLastPageChangeMs = 0;
 static bool gPageDirty = false;
-static uint32_t gLastChannelCheckMs = 0;
 static bool gPrevLinked = false;
-static uint8_t gLinkMissStreak = 0;
 static UiMode gUiMode = UiMode::PageView;
 static bool gLongPressConsumed = false;
 static uint8_t gSavedPageBeforeBrightness = 0;
@@ -166,12 +93,7 @@ static uint32_t gBrightnessLastInputMs = 0;
 static uint8_t gBacklightLevel = 0;
 static uint32_t gCpuTargetMhz = UI_CPU_MHZ;
 static bool gWifiRuntimeEnabled = (ENABLE_WIFI_RADIO != 0);
-static bool gBluetoothRuntimeEnabled =
-#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
-    true;
-#else
-    false;
-#endif
+static bool gBluetoothRuntimeEnabled = false;
 
 static bool gUpRaw = false;
 static bool gDownRaw = false;
@@ -188,16 +110,10 @@ static bool gSystemUpExecConsumed = false;
 static bool gSystemDownExitConsumed = false;
 static bool gBrightnessUpHoldConsumed = false;
 static bool gBrightnessDownHoldConsumed = false;
-
-static uint16_t colBg;
-static uint16_t colPanel;
-static uint16_t colText;
-static uint16_t colMuted;
-static uint16_t colOn;
-static uint16_t colOff;
-static uint16_t colHz;
-static uint16_t colAccent;
-static uint16_t colTrack;
+static bool gBrightnessWaitRelease = false;
+static bool gThemeHoldConsumed = false;
+static UiTheme gTheme = UiTheme::Dark;
+static uint32_t gThemeToastUntilMs = 0;
 
 static uint8_t clampBrightnessPercent(uint8_t value)
 {
@@ -266,24 +182,43 @@ static void saveBrightnessPercent(uint8_t value)
     prefs.end();
 }
 
+static UiTheme sanitizeTheme(uint8_t raw)
+{
+    return (raw == (uint8_t)UiTheme::Light) ? UiTheme::Light : UiTheme::Dark;
+}
+
+static void saveTheme(UiTheme theme)
+{
+    Preferences prefs;
+    if (!prefs.begin("settings", false)) return;
+    prefs.putUChar("theme", (uint8_t)theme);
+    prefs.end();
+}
+
+static void cycleTheme()
+{
+    gTheme = (gTheme == UiTheme::Dark) ? UiTheme::Light : UiTheme::Dark;
+    saveTheme(gTheme);
+    gThemeToastUntilMs = millis() + kThemeToastMs;
+    Serial.printf("[SYS] Theme -> %s\n", (gTheme == UiTheme::Light) ? "LIGHT" : "DARK");
+}
+
 static void loadRuntimeSettings()
 {
     Preferences prefs;
     if (!prefs.begin("settings", true)) {
         gCpuTargetMhz = sanitizeCpuProfile(UI_CPU_MHZ);
         gWifiRuntimeEnabled = (ENABLE_WIFI_RADIO != 0);
-        gBluetoothRuntimeEnabled =
-#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
-            true;
-#else
-            false;
-#endif
+        gBluetoothRuntimeEnabled = false;
+        gTheme = UiTheme::Dark;
         return;
     }
 
     gCpuTargetMhz = sanitizeCpuProfile(prefs.getUInt("cpu_mhz", UI_CPU_MHZ));
-    gWifiRuntimeEnabled = prefs.getBool("wifi_on", (ENABLE_WIFI_RADIO != 0));
-    gBluetoothRuntimeEnabled = prefs.getBool("bt_on", true);
+    // 모니터는 자동 연결이 필수이므로 과거 WiFi/BT NVS 토글은 무시한다.
+    gWifiRuntimeEnabled = (ENABLE_WIFI_RADIO != 0);
+    gBluetoothRuntimeEnabled = false;
+    gTheme = sanitizeTheme(prefs.getUChar("theme", (uint8_t)UiTheme::Dark));
     prefs.end();
 
 #if !ENABLE_WIFI_RADIO
@@ -303,68 +238,17 @@ static void saveCpuProfile(uint32_t mhz)
     prefs.end();
 }
 
-static void saveWifiRuntimeEnabled(bool enabled)
-{
-    Preferences prefs;
-    if (!prefs.begin("settings", false)) return;
-    prefs.putBool("wifi_on", enabled);
-    prefs.end();
-}
-
-static void saveBluetoothRuntimeEnabled(bool enabled)
-{
-    Preferences prefs;
-    if (!prefs.begin("settings", false)) return;
-    prefs.putBool("bt_on", enabled);
-    prefs.end();
-}
-
-static const char* nagModeToText(uint8_t mode)
-{
-    return (mode == kNagModeFixed) ? "FIXED" : "DYNAMIC";
-}
-
-static const char* twaiStateToText(uint8_t state)
-{
-    if (state == 1) return "OK";
-    if (state == 2) return "BUS_OFF";
-    if (state == 3) return "RECOVER";
-    return "INIT";
-}
-
-static bool initEspNowReceiver();
-
-static const char* wifiStatusText()
-{
-#if ENABLE_WIFI_RADIO
-    if (!gWifiRuntimeEnabled) return "OFF(RUNTIME)";
-    if (WiFi.getMode() == WIFI_OFF) return "OFF(RUNTIME)";
-    return "ON";
-#else
-    return "OFF(BUILD)";
-#endif
-}
-
-static const char* btStatusText()
-{
-#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
-    if (!gBluetoothRuntimeEnabled) return "OFF(RUNTIME)";
-    return "ON";
-#else
-    return "OFF(BUILD)";
-#endif
-}
+static bool initMonitorWifi();
+static void serviceMonitorClient();
 
 static void applyWifiBtCoexistPolicy()
 {
 #if ENABLE_WIFI_RADIO
     if (WiFi.getMode() == WIFI_OFF) return;
 
-    // ESP-NOW 수신기는 연속 수신 감도가 중요하므로, BT 런타임이 켜져 있어도
-    // WiFi modem sleep은 사용하지 않습니다.
+    // 1초 HTTP 폴링의 재연결 지연을 줄이기 위해 WiFi sleep을 끄고 유지한다.
     WiFi.setSleep(false);
-    esp_wifi_set_ps(WIFI_PS_NONE);
-    Serial.println("[SYS] Coexist: WiFi modem sleep OFF (ESP-NOW priority)");
+    Serial.println("[SYS] WiFi modem sleep OFF (T2-CAN monitor)");
 #endif
 }
 
@@ -406,6 +290,7 @@ static UiRenderContext buildUiRenderContext()
     ctx.brightnessAdjustMode = (gUiMode == UiMode::BrightnessAdjust);
     ctx.systemEditMode = (gUiMode == UiMode::SystemEdit);
     ctx.bluetoothRuntimeEnabled = gBluetoothRuntimeEnabled;
+    ctx.themeToastUntilMs = gThemeToastUntilMs;
     ctx.noSignalBlinkMs = kNoSignalBlinkMs;
 
     bool wifiOn = gWifiRuntimeEnabled;
@@ -414,15 +299,7 @@ static UiRenderContext buildUiRenderContext()
 #endif
     ctx.wifiRuntimeEnabled = wifiOn;
 
-    ctx.colBg = colBg;
-    ctx.colPanel = colPanel;
-    ctx.colText = colText;
-    ctx.colMuted = colMuted;
-    ctx.colOn = colOn;
-    ctx.colOff = colOff;
-    ctx.colHz = colHz;
-    ctx.colAccent = colAccent;
-    ctx.colTrack = colTrack;
+    uiApplyThemePalette(ctx, gTheme);
     return ctx;
 }
 
@@ -471,6 +348,16 @@ static bool handlePageButtons()
 
     if (gUiMode == UiMode::BrightnessAdjust) {
         bool changed = false;
+        // 밝기 화면 진입 직후에는 기존 롱프레스 입력을 무시하고,
+        // 버튼을 한 번 떼야 다음 입력부터 반영한다.
+        if (gBrightnessWaitRelease) {
+            gBrightnessLastInputMs = now;
+            if (!gUpStable && !gDownStable) {
+                gBrightnessWaitRelease = false;
+            }
+            return false;
+        }
+
         if (upPressedEdge) {
             gBrightnessUpHoldConsumed = false;
             gBrightnessLastInputMs = now;
@@ -554,46 +441,16 @@ static bool handlePageButtons()
             const SystemItem item = (SystemItem)gSystemSelected;
             if (item == SystemItem::CpuProfile) {
                 cycleCpuProfile();
-            } else if (item == SystemItem::WifiRuntime) {
-#if ENABLE_WIFI_RADIO
-                if (!gWifiRuntimeEnabled || WiFi.getMode() == WIFI_OFF) {
-                    if (initEspNowReceiver()) {
-                        gWifiRuntimeEnabled = true;
-                        saveWifiRuntimeEnabled(true);
-                    }
-                } else {
-                    esp_now_deinit();
-                    WiFi.mode(WIFI_OFF);
-                    gWifiRuntimeEnabled = false;
-                    saveWifiRuntimeEnabled(false);
-                    Serial.println("[SYS] WiFi runtime -> OFF");
-                }
-#endif
-            } else if (item == SystemItem::BluetoothBuild) {
-#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
-                if (gBluetoothRuntimeEnabled) {
-                    if (btStarted()) {
-                        btStop();
-                    }
-                    gBluetoothRuntimeEnabled = false;
-                    saveBluetoothRuntimeEnabled(false);
-                    Serial.println("[SYS] Bluetooth runtime -> OFF");
-                } else {
-                    if (!btStarted()) {
-                        btStart();
-                    }
-                    gBluetoothRuntimeEnabled = true;
-                    saveBluetoothRuntimeEnabled(true);
-                    Serial.println("[SYS] Bluetooth runtime -> ON");
-                }
-                applyWifiBtCoexistPolicy();
-#endif
             } else if (item == SystemItem::BrightnessQuick) {
                 gSavedPageBeforeBrightness = gCurrentPage;
                 gUiMode = UiMode::BrightnessAdjust;
                 gBrightnessUpHoldConsumed = false;
                 gBrightnessDownHoldConsumed = false;
                 gBrightnessLastInputMs = now;
+                gBrightnessWaitRelease = true;
+            } else if (item == SystemItem::Theme) {
+                cycleTheme();
+                gPageDirty = true;
             }
             gSystemUpExecConsumed = true;
             gPageDirty = true;
@@ -612,11 +469,22 @@ static bool handlePageButtons()
         return changed;
     }
 
-    if (gCurrentPage == 3 && gDownStable && !gSystemDownExitConsumed && (now - gDownPressedStartMs >= kSystemEditEnterHoldMs)) {
+    // SYSTEM 페이지: DOWN 2초 → 편집 진입 (테마 단축키보다 우선)
+    if (gCurrentPage == 4 && gDownStable && !gSystemDownExitConsumed && (now - gDownPressedStartMs >= kSystemEditEnterHoldMs)) {
         gUiMode = UiMode::SystemEdit;
         gSystemSelected = 0;
         gSystemUpExecConsumed = false;
         gSystemDownExitConsumed = true;
+        gThemeHoldConsumed = true;
+        gPageDirty = true;
+        return true;
+    }
+
+    // A안: SYSTEM 이외 페이지에서 DOWN 3초 → 테마 토글
+    if (gCurrentPage != 4 && gDownStable && !gThemeHoldConsumed &&
+        (now - gDownPressedStartMs >= kThemeToggleHoldMs)) {
+        cycleTheme();
+        gThemeHoldConsumed = true;
         gPageDirty = true;
         return true;
     }
@@ -630,10 +498,15 @@ static bool handlePageButtons()
             gBrightnessUpHoldConsumed = false;
             gBrightnessDownHoldConsumed = false;
             gBrightnessLastInputMs = now;
+            gBrightnessWaitRelease = true;
             gPageDirty = true;
             gLongPressConsumed = true;
             return true;
         }
+    }
+
+    if (downPressedEdge) {
+        gThemeHoldConsumed = false;
     }
 
     // 클릭 1회당 페이지 1단계만 이동시켜 과도한 점프를 방지합니다.
@@ -643,11 +516,12 @@ static bool handlePageButtons()
 
     bool changed = false;
 
-    if (downReleasedEdge) {
+    if (upReleasedEdge) {
         gCurrentPage = (uint8_t)((gCurrentPage + 1) % kPageCount);
         gPageDirty = true;
         changed = true;
-    } else if (!gLongPressConsumed && upReleasedEdge) {
+    } else if (!gThemeHoldConsumed && !gLongPressConsumed && downReleasedEdge) {
+        // 테마 롱프레스 직후 릴리즈는 페이지 이동으로 취급하지 않습니다.
         gCurrentPage = (uint8_t)((gCurrentPage + kPageCount - 1) % kPageCount);
         gPageDirty = true;
         changed = true;
@@ -655,125 +529,187 @@ static bool handlePageButtons()
 
     if (changed) gLastPageChangeMs = now;
     if (!gUpStable) gLongPressConsumed = false;
-    if (!gDownStable) gSystemDownExitConsumed = false;
+    if (!gDownStable) {
+        gSystemDownExitConsumed = false;
+        // 홀드 소비 플래그는 다음 press에서 리셋 (릴리즈 직후 페이지 점프 방지)
+    }
 
     (void)upReleasedEdge;
     (void)downReleasedEdge;
     return changed;
 }
 
-static bool initEspNowReceiver()
+static cJSON* jsonChild(cJSON* parent, const char* key)
 {
-#if !ENABLE_WIFI_RADIO
-    Serial.println("[ESP-NOW] disabled by ENABLE_WIFI_RADIO=0");
-    return false;
-#else
-#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
-    if (gBluetoothRuntimeEnabled) {
-        if (btStarted()) {
-            btStop();
-        }
-        gBluetoothRuntimeEnabled = false;
-        saveBluetoothRuntimeEnabled(false);
-        Serial.println("[SYS] Bluetooth runtime -> OFF (ESP-NOW priority)");
-    }
-#endif
+    return parent ? cJSON_GetObjectItemCaseSensitive(parent, key) : nullptr;
+}
 
-    WiFi.mode(WIFI_STA);
-    applyWifiBtCoexistPolicy();
+static uint32_t jsonU32(cJSON* parent, const char* key, uint32_t fallback = 0)
+{
+    cJSON* item = jsonChild(parent, key);
+    return cJSON_IsNumber(item) && item->valuedouble >= 0.0
+        ? (uint32_t)item->valuedouble : fallback;
+}
 
-    // 송신기/수신기 안정 페어링을 위해 WiFi 채널을 고정합니다.
-    // 일부 보드는 promiscuous 토글을 거쳐야 채널 적용이 더 안정적입니다.
-    esp_wifi_set_promiscuous(true);
-    esp_err_t chRet = esp_wifi_set_channel(kWifiChannel, WIFI_SECOND_CHAN_NONE);
-    esp_wifi_set_promiscuous(false);
-    if (chRet != ESP_OK) {
-        Serial.printf("[ESP-NOW] channel set failed: %d\n", (int)chRet);
-    }
+static float jsonFloat(cJSON* parent, const char* key, float fallback = 0.0f)
+{
+    cJSON* item = jsonChild(parent, key);
+    return cJSON_IsNumber(item) ? (float)item->valuedouble : fallback;
+}
 
-    Serial.printf("[ESP-NOW] Local MAC (STA): %s\n", WiFi.macAddress().c_str());
-    Serial.printf("[ESP-NOW] WiFi channel fixed: %u\n", (unsigned)kWifiChannel);
+static bool jsonBool(cJSON* parent, const char* key, bool fallback = false)
+{
+    cJSON* item = jsonChild(parent, key);
+    return cJSON_IsBool(item) ? cJSON_IsTrue(item) : fallback;
+}
 
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("[ESP-NOW] init failed");
+static void jsonText(cJSON* parent, const char* key, char* out, size_t outSize, const char* fallback)
+{
+    cJSON* item = jsonChild(parent, key);
+    const char* value = cJSON_IsString(item) && item->valuestring ? item->valuestring : fallback;
+    strlcpy(out, value, outSize);
+}
+
+static bool parseMonitorPayload(const String& payload, UiState& out)
+{
+    cJSON* root = cJSON_ParseWithLength(payload.c_str(), payload.length());
+    if (!root) return false;
+    const uint32_t schema = jsonU32(root, "schema", 0);
+    if (schema != kMonitorSchema) {
+        cJSON_Delete(root);
         return false;
     }
 
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-    esp_now_register_recv_cb([](const esp_now_recv_info_t* info, const uint8_t* data, int len) {
-        struct_message parsed = {};
-        if (!decodeTelemetryPacket(parsed, data, len)) {
-            gBadLengthPacketCount++;
-            return;
-        }
+    out = {};
+    out.schemaOk = true;
+    out.t2Uptime = jsonU32(root, "uptime_s");
+    out.otaState = jsonU32(root, "ota_state");
+    jsonText(root, "firmware", out.firmware, sizeof(out.firmware), "--");
+    jsonText(root, "build", out.build, sizeof(out.build), "--");
 
-        static bool firstRxLogged = false;
-        portENTER_CRITICAL_ISR(&gDataMux);
-        gLatestMsg = parsed;
-        gHasData = true;
-        gLastRxMs = millis();
-        gRxPacketCount++;
-        if (info && info->src_addr) memcpy(gLastSenderMac, info->src_addr, 6);
-        portEXIT_CRITICAL_ISR(&gDataMux);
+    cJSON* a = jsonChild(root, "a");
+    out.aHealthLevel = (uint8_t)jsonU32(a, "level", 2);
+    jsonText(a, "state", out.aHealthState, sizeof(out.aHealthState), "INIT");
+    out.hzA = jsonFloat(a, "hz");
+    out.aFrameAgeMs = jsonU32(a, "age_ms");
+    out.aBusoffCount = jsonU32(a, "busoff");
+    out.aEflg = jsonU32(a, "eflg");
+    out.aTec = jsonU32(a, "tec");
+    out.aRec = jsonU32(a, "rec");
+    out.aRxOverrun = jsonU32(a, "rx_overrun");
+    out.aTxQueued = jsonU32(a, "tx_q");
+    out.aTxBusy = jsonU32(a, "tx_busy");
+    out.aTxHard = jsonU32(a, "tx_hard");
+    out.aTxGuard = jsonBool(a, "tx_guard");
 
-        if (!firstRxLogged && info && info->src_addr) {
-            firstRxLogged = true;
-            Serial.printf("[ESP-NOW] first packet from %02X:%02X:%02X:%02X:%02X:%02X len=%d\n",
-                          info->src_addr[0], info->src_addr[1], info->src_addr[2],
-                          info->src_addr[3], info->src_addr[4], info->src_addr[5], len);
-        }
-    });
+    cJSON* b = jsonChild(root, "b");
+    out.bHealthLevel = (uint8_t)jsonU32(b, "level", 2);
+    jsonText(b, "state", out.bHealthState, sizeof(out.bHealthState), "INIT");
+    out.hzB = jsonFloat(b, "hz");
+    out.bFrameAgeMs = jsonU32(b, "age_ms");
+    out.bBusoffCount = jsonU32(b, "busoff");
+    out.bTwaiState = jsonU32(b, "twai");
+    out.bTec = jsonU32(b, "tec");
+    out.bRec = jsonU32(b, "rec");
+    out.bRecoveryQuietMs = jsonU32(b, "recovery_quiet_ms");
+    out.bArbLost = jsonU32(b, "arb_lost");
+    out.bBusError = jsonU32(b, "bus_error");
+    out.bTxFailed = jsonU32(b, "tx_failed");
+    out.bEchoCount = jsonU32(b, "echo");
+
+    cJSON* f = jsonChild(root, "features");
+    out.eceR79 = jsonBool(f, "ece_r79");
+    out.summon = jsonBool(f, "summon");
+    out.tsllc = jsonBool(f, "tsllc");
+    out.nag = jsonBool(f, "nag");
+    out.nagMode = (uint8_t)jsonU32(f, "nag_mode");
+    out.nagApOnly = jsonBool(f, "nag_ap_only");
+    out.nagReady = jsonBool(f, "nag_ready");
+
+    cJSON* gate = jsonChild(root, "gate");
+    out.gateOpen = jsonBool(gate, "open");
+    jsonText(gate, "reason", out.gateReason, sizeof(out.gateReason), "UNKNOWN");
+    out.apActive = jsonBool(gate, "ap");
+    out.apState = (uint8_t)jsonU32(gate, "ap_state");
+    out.apStableMs = jsonU32(gate, "ap_stable_ms");
+    out.parked = jsonBool(gate, "parked");
+    out.summoning = jsonBool(gate, "summoning");
+    out.summonTxOk = jsonU32(gate, "tx_ok");
+    out.summonTxFail = jsonU32(gate, "tx_fail");
+    out.summonBlocked = jsonU32(gate, "blocked");
+
+    cJSON* mark = jsonChild(root, "user_mark");
+    out.userMarkActive = jsonBool(mark, "active");
+    out.userMarkCount = jsonU32(mark, "count");
+    cJSON_Delete(root);
+    return true;
+}
+
+static bool initMonitorWifi()
+{
+#if !ENABLE_WIFI_RADIO
+    Serial.println("[MON] WiFi disabled by build flag");
+    return false;
 #else
-    esp_now_register_recv_cb([](const uint8_t* mac, const uint8_t* data, int len) {
-        struct_message parsed = {};
-        if (!decodeTelemetryPacket(parsed, data, len)) {
-            gBadLengthPacketCount++;
-            return;
-        }
-
-        static bool firstRxLogged = false;
-        portENTER_CRITICAL_ISR(&gDataMux);
-        gLatestMsg = parsed;
-        gHasData = true;
-        gLastRxMs = millis();
-        gRxPacketCount++;
-        if (mac) memcpy(gLastSenderMac, mac, 6);
-        portEXIT_CRITICAL_ISR(&gDataMux);
-
-        if (!firstRxLogged && mac) {
-            firstRxLogged = true;
-            Serial.printf("[ESP-NOW] first packet from %02X:%02X:%02X:%02X:%02X:%02X len=%d\n",
-                          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], len);
-        }
-    });
+#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
+    if (btStarted()) btStop();
 #endif
-
-    Serial.println("[ESP-NOW] receiver ready");
+    gBluetoothRuntimeEnabled = false;
+    gWifiRuntimeEnabled = true;
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    applyWifiBtCoexistPolicy();
+    WiFi.begin(kT2CanSsid, kT2CanPassword);
+    gLastReconnectMs = millis();
+    Serial.printf("[MON] connecting to %s\n", kT2CanSsid);
     return true;
 #endif
 }
 
-static void ensureReceiverChannel()
+static void serviceMonitorClient()
 {
 #if ENABLE_WIFI_RADIO
     const uint32_t now = millis();
-    if (now - gLastChannelCheckMs < kChannelCheckIntervalMs) return;
-    gLastChannelCheckMs = now;
-
-    uint8_t primary = 0;
-    wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
-    if (esp_wifi_get_channel(&primary, &second) != ESP_OK) return;
-    if (primary == kWifiChannel) return;
-
-    Serial.printf("[ESP-NOW] channel drift detected: %u -> %u\n", (unsigned)primary, (unsigned)kWifiChannel);
-    esp_wifi_set_promiscuous(true);
-    esp_err_t chRet = esp_wifi_set_channel(kWifiChannel, WIFI_SECOND_CHAN_NONE);
-    esp_wifi_set_promiscuous(false);
-    if (chRet != ESP_OK) {
-        Serial.printf("[ESP-NOW] channel restore failed: %d\n", (int)chRet);
-    } else {
-        Serial.println("[ESP-NOW] channel restored");
+    if (WiFi.status() != WL_CONNECTED) {
+        if (now - gLastReconnectMs >= kWifiReconnectMs) {
+            gLastReconnectMs = now;
+            WiFi.disconnect(false, false);
+            WiFi.begin(kT2CanSsid, kT2CanPassword);
+            Serial.println("[MON] TeslaCAN reconnect");
+        }
+        return;
     }
+    if (now - gLastRequestMs < kMonitorPollMs) return;
+    gLastRequestMs = now;
+
+    WiFiClient client;
+    HTTPClient http;
+    http.setConnectTimeout(500);
+    http.setTimeout(700);
+    if (!http.begin(client, kMonitorUrl)) {
+        gRequestFailCount++;
+        return;
+    }
+    const int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+        gRequestFailCount++;
+        http.end();
+        return;
+    }
+    const String payload = http.getString();
+    http.end();
+    UiState parsed;
+    if (!parseMonitorPayload(payload, parsed)) {
+        gParseFailCount++;
+        return;
+    }
+    gRequestOkCount++;
+    parsed.wifiRssi = WiFi.RSSI();
+    portENTER_CRITICAL(&gDataMux);
+    gLatestState = parsed;
+    gHasData = true;
+    gLastRxMs = millis();
+    portEXIT_CRITICAL(&gDataMux);
 #endif
 }
 
@@ -818,16 +754,7 @@ void setup()
 
     tft.init();
     tft.setRotation(1);
-
-    colBg = tft.color565(8, 11, 15);
-    colPanel = tft.color565(20, 28, 38);
-    colText = tft.color565(232, 238, 245);
-    colMuted = tft.color565(145, 160, 178);
-    colOn = tft.color565(40, 220, 120);
-    colOff = tft.color565(245, 74, 74);
-    colHz = tft.color565(250, 208, 58);
-    colAccent = tft.color565(45, 70, 94);
-    colTrack = tft.color565(30, 125, 188);
+    Serial.printf("[SYS] Theme %s\n", (gTheme == UiTheme::Light) ? "LIGHT" : "DARK");
 
     if (!canvas.createSprite(320, 170)) {
         Serial.println("[UI] sprite allocation failed");
@@ -839,11 +766,7 @@ void setup()
     // 부팅 직후 초기 화면을 즉시 그려 사용자에게 확정된 상태를 보여줍니다.
     uiRender(canvas, boot, buildUiRenderContext());
 
-    if (gWifiRuntimeEnabled) {
-        initEspNowReceiver();
-    } else {
-        Serial.println("[ESP-NOW] skipped by persisted runtime setting");
-    }
+    initMonitorWifi();
 }
 
 void loop()
@@ -852,7 +775,7 @@ void loop()
 
     // 홀드/릴리즈 타이밍 정확도를 위해 버튼은 매 loop마다 폴링합니다.
     const bool buttonChanged = handlePageButtons();
-    ensureReceiverChannel();
+    serviceMonitorClient();
 
     uint32_t now = millis();
     const uint32_t renderInterval = (gUiMode == UiMode::BrightnessAdjust) ? 33 : kRenderIntervalMs;
@@ -861,77 +784,55 @@ void loop()
     }
     lastRenderMs = now;
 
-    struct_message msg = {};
+    UiState next = {};
     bool hasData = false;
     uint32_t lastRx = 0;
 
     portENTER_CRITICAL(&gDataMux);
-    msg = gLatestMsg;
+    next = gLatestState;
     hasData = gHasData;
     lastRx = gLastRxMs;
     portEXIT_CRITICAL(&gDataMux);
 
-    // 최신 수신 패킷 스냅샷으로 다음 프레임 상태를 구성합니다.
-    UiState next;
-    next.uptime = now / 1000u;
-    next.hzA = msg.hz_a;
-    next.hzB = msg.hz_b;
-    next.nag = msg.nag_active;
-    next.eap = msg.eap_active;
-    next.nagMode = msg.nag_mode;
-    next.twaiState = msg.twai_state;
-    next.echoCount = msg.echo_count;
-    next.txFailCount = msg.tx_fail_count;
-    next.aFramesTotal = msg.a_frames_total;
-    next.aFrames1021 = msg.a_frames_1021;
-    next.aEapModified = msg.a_eap_modified;
-    next.bFramesTotal = msg.b_frames_total;
-    next.bFrames880 = msg.b_frames_880;
-    next.bFrames921 = msg.b_frames_921;
-    next.bBusoffCount = msg.b_busoff_count;
-    next.torqueNm = msg.torque_nm;
-    next.stealthTorqueNm = msg.stealth_torque_nm;
-
-    // RF 지터로 생기는 짧은 패킷 공백에서 오탐(NO SIGNAL) 방지를 위해 디바운스를 둡니다.
-    // 단, 유효 패킷을 한 번도 못 받은 부팅 초기에는 링크로 간주하지 않습니다.
-    const bool linkFresh = hasData && (now - lastRx <= kLinkTimeoutMs);
-    if (linkFresh) {
-        gLinkMissStreak = 0;
-        next.linked = true;
-    } else if (!hasData) {
-        gLinkMissStreak = kLinkMissDebounceFrames;
-        next.linked = false;
-    } else {
-        if (gLinkMissStreak < 255) gLinkMissStreak++;
-        next.linked = (gLinkMissStreak < kLinkMissDebounceFrames);
-    }
+    next.localUptime = now / 1000U;
+    next.responseAgeMs = hasData ? now - lastRx : 0;
+    next.requestOk = gRequestOkCount;
+    next.requestFail = gRequestFailCount;
+    next.parseFail = gParseFailCount;
+    next.wifiRssi = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -127;
+    next.linked = hasData && next.schemaOk && next.responseAgeMs <= kLinkTimeoutMs;
 
     if (next.linked != gPrevLinked) {
         if (next.linked) {
-            Serial.printf("[LINK] reconnected. rx_pkts=%lu bad_len=%lu tx_fail=%lu\n",
-                          (unsigned long)gRxPacketCount,
-                          (unsigned long)gBadLengthPacketCount,
-                          (unsigned long)next.txFailCount);
+            Serial.printf("[LINK] T2-CAN connected. ok=%lu fail=%lu parse=%lu\n",
+                          (unsigned long)gRequestOkCount,
+                          (unsigned long)gRequestFailCount,
+                          (unsigned long)gParseFailCount);
         } else {
             const uint32_t age = hasData ? (now - lastRx) : 0;
-            Serial.printf("[LINK] lost. age=%lums rx_pkts=%lu bad_len=%lu last_tx_fail=%lu\n",
+            Serial.printf("[LINK] T2-CAN lost. age=%lums ok=%lu fail=%lu parse=%lu\n",
                           (unsigned long)age,
-                          (unsigned long)gRxPacketCount,
-                          (unsigned long)gBadLengthPacketCount,
-                          (unsigned long)next.txFailCount);
+                          (unsigned long)gRequestOkCount,
+                          (unsigned long)gRequestFailCount,
+                          (unsigned long)gParseFailCount);
         }
         gPrevLinked = next.linked;
     }
 
-    if (!next.linked && now > kLinkTimeoutMs) {
-        next.hzA = 0.0f;
-        next.hzB = 0.0f;
-        next.torqueNm = 0.0f;
-        next.stealthTorqueNm = 0.0f;
+    // 테마 토스트 표시 중/종료 시에도 한 프레임 갱신합니다.
+    bool themeToastActive = false;
+    if (gThemeToastUntilMs != 0) {
+        if (now < gThemeToastUntilMs) {
+            themeToastActive = true;
+        } else {
+            gThemeToastUntilMs = 0;
+            gPageDirty = true;
+        }
     }
 
     // 버튼 이벤트가 있거나 화면 데이터가 바뀐 경우에만 렌더링합니다.
-    if (buttonChanged || gPageDirty || (gUiMode == UiMode::BrightnessAdjust) || uiNeedsRender(gShown, next, gCurrentPage, kPageCount) || !next.linked) {
+    if (buttonChanged || gPageDirty || themeToastActive || (gUiMode == UiMode::BrightnessAdjust) ||
+        uiNeedsRender(gShown, next, gCurrentPage, kPageCount) || !next.linked) {
         uiRender(canvas, next, buildUiRenderContext());
         gShown = next;
         gPageDirty = false;

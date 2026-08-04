@@ -2,6 +2,32 @@
 
 이 프로젝트의 모든 주요 업데이트 내역을 기록하는 파일입니다.
 
+## [Unreleased]
+
+### 변경
+
+- 기존 ESP-NOW 페이로드 수신을 T2-CAN의 읽기 전용 `GET /api/monitor` HTTP 폴링으로 교체했다.
+- `TeslaCAN` AP에 자동 연결하고 연결이 끊기면 2초 간격으로 재연결하도록 변경했다.
+- 과거 Wi-Fi·Bluetooth NVS 토글은 무시하고 모니터 Wi-Fi는 항상 켜며 Bluetooth는 끄도록 정리했다.
+- 화면을 `개요 / A채널 / B채널 / 기능 / 시스템` 5페이지로 재설계했다.
+
+### 추가
+
+- API 스키마 1 검증, HTTP 성공·실패·파싱 오류 카운터와 RSSI·응답 지연 표시를 추가했다.
+- A채널 MCP2515 EFLG·TEC/REC·RX 오버런·TX Guard와 B채널 TWAI BUS-OFF·복구 대기·통신 오류 표시를 추가했다.
+- ECE R79, Summon, TSLLC, Nag Mode/AP 전용, AP 상태, 게이트 사유, USER_MARK 표시를 추가했다.
+- 마지막 정상 응답이 3.2초를 넘으면 `NO SIGNAL`을 표시하도록 했다.
+- Light / Dark 테마 (`uiApplyThemePalette`, SYSTEM 편집, Preferences `theme`)를 추가했다.
+- 테마 단축키: SYSTEM 외 페이지에서 **DOWN 3초** 토글 + 토스트, SYSTEM 하단 조작 힌트를 추가했다 (A+E).
+- 320×170 실측 웹 프리뷰 (`preview/index.html`)를 추가했다.
+
+### 안전성
+
+- T-Display-S3에는 차량 기능 제어, CAN 송신, 설정 POST, OTA 요청 경로를 두지 않는다.
+- HTTP 연결·응답 제한시간을 설정해 T2-CAN이 재부팅되거나 응답하지 않을 때 화면이 오래 멈추지 않도록 했다.
+
+---
+
 ## [1.1.0] - 2026-04-22
 
 ### 🆕 추가된 기능
