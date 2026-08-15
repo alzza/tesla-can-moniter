@@ -1,0 +1,933 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>T2-CAN Monitor · Firmware-synced Preview 320×170</title>
+  <style>
+    :root {
+      --app-bg: #0f1218;
+      --app-panel: #171c25;
+      --app-text: #e8eef5;
+      --app-muted: #8b97a8;
+      --app-border: #2a3342;
+      --app-accent: #3d8fd1;
+      --app-ok: #2ecc78;
+      --app-bad: #e74c3c;
+      --font: "SF Mono", Menlo, Consolas, "Apple SD Gothic Neo", monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; font-family: var(--font); color: var(--app-text);
+      background:
+        radial-gradient(1100px 520px at 8% -10%, #1a2740 0%, transparent 55%),
+        radial-gradient(900px 480px at 100% 0%, #1a2a22 0%, transparent 45%),
+        var(--app-bg);
+    }
+    .layout {
+      display: grid; grid-template-columns: 1fr 380px; gap: 18px;
+      max-width: 1280px; margin: 0 auto; padding: 20px;
+    }
+    @media (max-width: 1020px) { .layout { grid-template-columns: 1fr; } }
+    h1 { margin: 0 0 6px; font-size: 17px; }
+    .sub { margin: 0 0 14px; color: var(--app-muted); font-size: 12px; line-height: 1.5; }
+    .card {
+      background: var(--app-panel); border: 1px solid var(--app-border);
+      border-radius: 14px; padding: 14px;
+    }
+    .stage-wrap { margin-bottom: 14px; }
+    .meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    .badge {
+      border: 1px solid var(--app-border); border-radius: 999px;
+      padding: 3px 10px; font-size: 11px; color: var(--app-muted);
+    }
+    .badge strong { color: var(--app-text); }
+    .badge.ok { border-color: #245a3c; color: #9fe3bc; }
+    .badge.warn { border-color: #6a5220; color: #f0d58a; }
+    .stage {
+      min-height: 400px; display: grid; place-items: center;
+      background: linear-gradient(180deg, #10141c, #0b0e14);
+      border: 1px dashed #2b3444; border-radius: 12px; padding: 24px 12px; overflow: auto;
+    }
+    .device {
+      background: #0a0c10; border: 2px solid #3a4252; border-radius: 10px; padding: 8px;
+      box-shadow: 0 18px 40px rgba(0,0,0,.45);
+    }
+    .screen-scale {
+      width: calc(320px * var(--scale, 2));
+      height: calc(170px * var(--scale, 2));
+    }
+    /* ===== 펌웨어 논리 화면: 320x170 ===== */
+    .screen {
+      width: 320px; height: 170px; position: relative; overflow: hidden;
+      transform-origin: top left; transform: scale(var(--scale, 2));
+      font-family: Arial, "DejaVu Sans", "Apple SD Gothic Neo", sans-serif;
+      user-select: none;
+    }
+    .screen.theme-dark {
+      --c-bg: rgb(8,11,15); --c-panel: rgb(20,28,38); --c-text: rgb(232,238,245);
+      --c-muted: rgb(145,160,178); --c-on: rgb(40,220,120); --c-off: rgb(245,74,74);
+      --c-hz: rgb(250,208,58); --c-accent: rgb(45,70,94); --c-track: rgb(30,125,188);
+    }
+    .screen.theme-light {
+      --c-bg: rgb(242,245,248); --c-panel: rgb(255,255,255); --c-text: rgb(22,28,36);
+      --c-muted: rgb(95,110,128); --c-on: rgb(18,150,88); --c-off: rgb(210,55,55);
+      --c-hz: rgb(185,130,10); --c-accent: rgb(170,190,210); --c-track: rgb(40,120,175);
+    }
+    .canvas {
+      width: 320px; height: 170px; background: var(--c-bg); position: relative; color: var(--c-text);
+    }
+    .vguide { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--c-track); }
+    .vguide.l { left: 2px; } .vguide.r { left: 317px; }
+
+    /* drawPageHeader: 8,4 304x22 */
+    .hdr {
+      position: absolute; left: 8px; top: 4px; width: 304px; height: 22px;
+      background: var(--c-panel); border: 1px solid var(--c-accent); border-radius: 6px;
+      display: grid; grid-template-columns: 54px 1fr 48px; align-items: center;
+      padding: 0 6px; font-size: 12px; line-height: 1;
+    }
+    .hdr .hint { color: var(--c-muted); }
+    .hdr .title { text-align: center; font-weight: 700; font-size: 12px; }
+    .hdr .pg { text-align: right; color: var(--c-hz); font-size: 12px; }
+
+    /* drawHealthCard: x,32 148x65 */
+    .hcard {
+      position: absolute; top: 32px; width: 148px; height: 65px;
+      background: var(--c-panel); border-radius: 9px; border: 1px solid var(--lv);
+    }
+    .hcard .dot {
+      position: absolute; left: 9px; top: 9px; width: 10px; height: 10px;
+      border-radius: 50%; background: var(--lv);
+    }
+    .hcard .ch { position: absolute; left: 25px; top: 7px; color: var(--c-muted); font-size: 12px; }
+    .hcard .st { position: absolute; right: 10px; top: 7px; color: var(--lv); font-size: 12px; font-weight: 700; }
+    .hcard .hz {
+      position: absolute; left: 0; right: 0; top: 28px; text-align: center;
+      font-size: 22px; font-weight: 800;
+    }
+    .hcard .bo {
+      position: absolute; right: 9px; bottom: 5px; font-size: 10px;
+    }
+
+    /* drawFeatureChip: 148x25 */
+    .chip {
+      position: absolute; width: 148px; height: 25px; background: var(--c-panel);
+      border-radius: 7px; border: 1px solid var(--chip-b);
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 0 8px; font-size: 12px;
+    }
+    .chip .k { color: var(--c-muted); }
+    .chip .v { font-weight: 700; }
+
+    /* list rows — detail pages: y 34..134 step 20, line at y+16 (drawRow) */
+    .row {
+      position: absolute; left: 10px; width: 300px; height: 16px;
+      display: flex; justify-content: space-between; align-items: flex-start;
+      font-size: 12px;
+    }
+    .row::after {
+      content: ""; position: absolute; left: 0; right: 0; top: 16px; height: 1px;
+      background: var(--c-track); opacity: .85;
+    }
+    .row .k { color: var(--c-muted); }
+    .row .v { color: var(--c-text); font-weight: 600; }
+    /* system rows: line at y+15 (drawSystemRow) */
+    .row.sys::after { top: 15px; }
+    .row.hl {
+      left: 10px; width: 300px; height: 17px; top: auto;
+      background: var(--c-panel); border: 1px solid var(--c-accent); border-radius: 3px;
+      align-items: center; padding: 0 2px;
+    }
+    .row.hl::after { top: 15px; }
+    .row.hl .k { color: var(--c-hz); }
+
+    /* brightness */
+    .bp {
+      position: absolute; left: 24px; top: 42px; width: 272px; height: 84px;
+      background: var(--c-panel); border: 1px solid var(--c-accent); border-radius: 10px;
+    }
+    .bp .pct {
+      position: absolute; left: 0; right: 0; top: 10px; text-align: center;
+      font-size: 22px; font-weight: 800;
+    }
+    .bp .bar {
+      position: absolute; left: 16px; top: 34px; width: 240px; height: 22px;
+      background: var(--c-bg); border: 1px solid var(--c-track); border-radius: 6px; overflow: hidden;
+    }
+    .bp .bar > i { display: block; height: 100%; background: var(--c-hz); }
+    .bhelp {
+      position: absolute; left: 0; right: 0; top: 138px; text-align: center;
+      color: var(--c-muted); font-size: 12px;
+    }
+
+    .nosig {
+      position: absolute; left: 72px; top: 70px; width: 176px; height: 34px;
+      background: var(--c-panel); border: 1px solid var(--c-off); border-radius: 8px;
+      display: grid; place-items: center; color: var(--c-off); font-weight: 800; font-size: 18px;
+      animation: blink 900ms steps(1) infinite;
+    }
+    @keyframes blink { 0%,49%{opacity:1} 50%,100%{opacity:0} }
+
+    .controls { display: flex; flex-direction: column; gap: 12px; }
+    .card h2 {
+      margin: 0 0 10px; font-size: 11px; letter-spacing: .08em;
+      text-transform: uppercase; color: var(--app-muted);
+    }
+    .btn-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    button, select, input[type="number"], input[type="text"] {
+      font: inherit; border-radius: 8px; border: 1px solid var(--app-border);
+      background: #121821; color: var(--app-text); padding: 7px 9px; font-size: 12px; cursor: pointer;
+    }
+    button.active { border-color: var(--app-accent); background: #173049; }
+    button.primary { background: #1b4f7a; border-color: #2f7ab8; }
+    .field {
+      display: grid; grid-template-columns: 1fr minmax(90px, 120px); gap: 8px;
+      align-items: center; margin-bottom: 7px; font-size: 12px;
+    }
+    .field label { color: var(--app-muted); }
+    .field.full { grid-template-columns: 1fr; }
+    .toggle { display: inline-flex; gap: 8px; align-items: center; color: var(--app-muted); }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    details.card summary {
+      cursor: pointer; color: var(--app-muted); font-size: 11px;
+      letter-spacing: .08em; text-transform: uppercase; list-style: none;
+    }
+    details.card summary::-webkit-details-marker { display: none; }
+    details[open].card summary { margin-bottom: 10px; }
+    table.matrix {
+      width: 100%; border-collapse: collapse; font-size: 11px;
+    }
+    table.matrix th, table.matrix td {
+      border-bottom: 1px solid #243041; padding: 6px 4px; text-align: left; vertical-align: top;
+    }
+    table.matrix th { color: var(--app-muted); font-weight: 600; }
+    .ok { color: var(--app-ok); }
+    .bad { color: var(--app-bad); }
+    .muted { color: var(--app-muted); }
+    pre.dump {
+      margin: 0; max-height: 180px; overflow: auto; font-size: 10px; line-height: 1.4;
+      background: #0c1017; border: 1px solid var(--app-border); border-radius: 8px;
+      padding: 8px; color: #b7c5d6; white-space: pre-wrap;
+    }
+    .hint { font-size: 11px; color: var(--app-muted); line-height: 1.5; }
+    .hint code { background: #121821; color: #c9d7e8; padding: 1px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <section>
+      <div class="card stage-wrap">
+        <h1>Firmware-synced Preview · 320×170</h1>
+        <p class="sub">
+          이 화면은 <code>src/ui.cpp</code> / <code>src/ui.h</code> 렌더 규칙을 JS로 그대로 재현합니다.
+          문자열 포맷, 행 좌표, 테마 팔레트, NO SIGNAL 오버레이를 펌웨어와 맞춰 두었습니다.
+        </p>
+        <div class="meta">
+          <span class="badge">sync source <strong>src/ui.cpp</strong></span>
+          <span class="badge" id="badgePage">page <strong>0 OVERVIEW</strong></span>
+          <span class="badge" id="badgeTheme">theme <strong>DARK</strong></span>
+          <span class="badge" id="badgeMode">mode <strong>PageView</strong></span>
+          <span class="badge" id="badgeScale">scale <strong>2×</strong></span>
+          <span class="badge ok" id="badgeSync">matrix <strong>checking…</strong></span>
+        </div>
+        <div class="stage">
+          <div class="device">
+            <div class="screen-scale" id="screenScale" style="--scale:2">
+              <div class="screen theme-dark" id="screen" style="--scale:2">
+                <div class="canvas" id="canvas"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <details class="card" open>
+        <summary>기능별 연동 매트릭스 (preview ↔ firmware)</summary>
+        <table class="matrix" id="matrix"></table>
+        <p class="hint" style="margin-top:10px">
+          매트릭스 <span class="ok">SYNC</span> = 포맷/좌표/필드가 펌웨어와 동일.
+          프리뷰 전용 컨트롤(스케일, 샘플 JSON)은 연동 대상이 아닙니다.
+        </p>
+      </details>
+    </section>
+
+    <aside class="controls">
+      <div class="card">
+        <h2>Page / Mode (main.cpp)</h2>
+        <div class="btn-row" id="pageButtons">
+          <button data-page="0" class="active">0 OVERVIEW</button>
+          <button data-page="1">1 A</button>
+          <button data-page="2">2 B</button>
+          <button data-page="3">3 FEATURES</button>
+          <button data-page="4">4 SYSTEM</button>
+        </div>
+        <div class="btn-row" style="margin-top:8px">
+          <button id="btnBright">Brightness mode</button>
+          <button id="btnSysEdit">System edit</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Theme / Scale</h2>
+        <div class="btn-row" style="margin-bottom:8px">
+          <button id="btnDark" class="active">DARK</button>
+          <button id="btnLight">LIGHT</button>
+        </div>
+        <div class="btn-row">
+          <button data-scale="1">1×</button>
+          <button data-scale="2" class="active">2×</button>
+          <button data-scale="3">3×</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>UiRenderContext</h2>
+        <div class="field"><label>brightness %</label><input type="number" id="brightIn" min="10" max="100" step="10" value="80" /></div>
+        <div class="field"><label>systemSelected</label>
+          <select id="sysSel">
+            <option value="0">0 CPU</option>
+            <option value="1">1 Brightness</option>
+            <option value="2">2 Theme</option>
+          </select>
+        </div>
+        <div class="field"><label class="toggle"><input type="checkbox" id="linked" checked /> linked</label></div>
+      </div>
+
+      <details class="card" open>
+        <summary>UiState · Overview / features</summary>
+        <div class="field"><label>aHealthState</label><input type="text" id="aHealthState" value="OK" /></div>
+        <div class="field"><label>bHealthState</label><input type="text" id="bHealthState" value="OK" /></div>
+        <div class="grid2">
+          <div class="field"><label>aLevel</label><input type="number" id="aLv" min="0" max="2" value="0" /></div>
+          <div class="field"><label>bLevel</label><input type="number" id="bLv" min="0" max="2" value="0" /></div>
+          <div class="field"><label>hzA</label><input type="number" id="hzA" value="100" step="0.1" /></div>
+          <div class="field"><label>hzB</label><input type="number" id="hzB" value="50" step="0.1" /></div>
+          <div class="field"><label>aBusoff</label><input type="number" id="aBo" value="0" /></div>
+          <div class="field"><label>bBusoff</label><input type="number" id="bBo" value="0" /></div>
+        </div>
+        <div class="field"><label class="toggle"><input type="checkbox" id="ece" checked /> eceR79</label></div>
+        <div class="field"><label class="toggle"><input type="checkbox" id="summon" /> summon</label></div>
+        <div class="field"><label class="toggle"><input type="checkbox" id="tsllc" /> tsllc</label></div>
+        <div class="field"><label class="toggle"><input type="checkbox" id="nag" checked /> nag</label></div>
+        <div class="field"><label>nagMode</label><input type="number" id="nagMode" min="0" max="9" value="1" /></div>
+        <div class="field"><label class="toggle"><input type="checkbox" id="nagApOnly" /> nagApOnly</label></div>
+        <div class="field"><label class="toggle"><input type="checkbox" id="nagReady" checked /> nagReady</label></div>
+        <div class="field"><label class="toggle"><input type="checkbox" id="markActive" /> userMarkActive</label></div>
+        <div class="field"><label>userMarkCount</label><input type="number" id="markCount" value="0" /></div>
+      </details>
+
+      <details class="card">
+        <summary>UiState · A channel detail</summary>
+        <div class="field"><label>aFrameAgeMs</label><input type="number" id="aAge" value="12" /></div>
+        <div class="field"><label>aEflg</label><input type="number" id="aEflg" value="0" /></div>
+        <div class="field"><label>aTec / aRec</label><div class="grid2"><input type="number" id="aTec" value="0" /><input type="number" id="aRec" value="0" /></div></div>
+        <div class="field"><label>aRxOverrun</label><input type="number" id="aOvr" value="0" /></div>
+        <div class="field"><label>tx q/busy/hard</label><div class="grid2"><input type="number" id="aTxQ" value="0" /><input type="number" id="aTxBusy" value="0" /></div></div>
+        <div class="field"><label>aTxHard</label><input type="number" id="aTxHard" value="0" /></div>
+        <div class="field"><label class="toggle"><input type="checkbox" id="aTxGuard" /> aTxGuard</label></div>
+      </details>
+
+      <details class="card">
+        <summary>UiState · B channel detail</summary>
+        <div class="field"><label>bFrameAgeMs</label><input type="number" id="bAge" value="20" /></div>
+        <div class="field"><label>bTwaiState</label><input type="number" id="bTwai" value="1" /></div>
+        <div class="field"><label>bTec / bRec</label><div class="grid2"><input type="number" id="bTec" value="0" /><input type="number" id="bRec" value="0" /></div></div>
+        <div class="field"><label>bRecoveryQuietMs</label><input type="number" id="bQuiet" value="0" /></div>
+        <div class="field"><label>bEchoCount</label><input type="number" id="bEcho" value="12" /></div>
+        <div class="field"><label>arb/err/fail</label><div class="grid2"><input type="number" id="bArb" value="0" /><input type="number" id="bErr" value="0" /></div></div>
+        <div class="field"><label>bTxFailed</label><input type="number" id="bFail" value="0" /></div>
+      </details>
+
+      <details class="card">
+        <summary>UiState · Features / gate / system</summary>
+        <div class="field"><label class="toggle"><input type="checkbox" id="apActive" /> apActive</label></div>
+        <div class="field"><label>apState</label><input type="number" id="apState" value="0" /></div>
+        <div class="field"><label>apStableMs</label><input type="number" id="apStable" value="0" /></div>
+        <div class="field"><label class="toggle"><input type="checkbox" id="parked" checked /> parked</label></div>
+        <div class="field"><label class="toggle"><input type="checkbox" id="summoning" /> summoning</label></div>
+        <div class="field"><label class="toggle"><input type="checkbox" id="gateOpen" /> gateOpen</label></div>
+        <div class="field"><label>gateReason</label><input type="text" id="gateReason" value="NO_AP" /></div>
+        <div class="field"><label>summon tx ok/fail/block</label>
+          <div class="grid2">
+            <input type="number" id="sumOk" value="0" />
+            <input type="number" id="sumFail" value="0" />
+          </div>
+        </div>
+        <div class="field"><label>summonBlocked</label><input type="number" id="sumBlock" value="0" /></div>
+        <div class="field"><label>firmware</label><input type="text" id="fw" value="t2-can" /></div>
+        <div class="field"><label>build</label><input type="text" id="build" value="2026-08-04" /></div>
+        <div class="field"><label>otaState</label><input type="number" id="ota" value="0" /></div>
+        <div class="field"><label>wifiRssi</label><input type="number" id="rssi" value="-48" /></div>
+        <div class="field"><label>responseAgeMs</label><input type="number" id="age" value="120" /></div>
+        <div class="field"><label>req ok/fail/parse</label>
+          <div class="grid2">
+            <input type="number" id="ok" value="42" />
+            <input type="number" id="fail" value="1" />
+          </div>
+        </div>
+        <div class="field"><label>parseFail</label><input type="number" id="parse" value="0" /></div>
+        <div class="field"><label>t2Uptime s</label><input type="number" id="uptime" value="3661" /></div>
+        <div class="field"><label>cpu MHz (display)</label><input type="number" id="cpu" value="80" /></div>
+      </details>
+
+      <div class="card">
+        <h2>Rendered strings dump</h2>
+        <pre class="dump" id="dump"></pre>
+      </div>
+
+      <div class="card hint">
+        <div><strong>조작</strong></div>
+        <div>←/→ 페이지 · <code>T</code> 테마(DN3s) · <code>B</code> 밝기(UP3s) · <code>E</code> SYSTEM 편집</div>
+        <div>열기: <code>open preview/index.html</code></div>
+      </div>
+    </aside>
+  </div>
+
+  <script>
+    /**
+     * ============================================================
+     * FIRMWARE MIRROR
+     * Source of truth: src/ui.h, src/ui.cpp, src/main.cpp
+     * Keep format strings and coordinates in lockstep with C++.
+     * ============================================================
+     */
+
+    // uiApplyThemePalette()
+    const THEMES = {
+      dark: {
+        name: "DARK",
+        css: "theme-dark",
+        colors: {
+          colBg:[8,11,15], colPanel:[20,28,38], colText:[232,238,245], colMuted:[145,160,178],
+          colOn:[40,220,120], colOff:[245,74,74], colHz:[250,208,58], colAccent:[45,70,94], colTrack:[30,125,188],
+        },
+      },
+      light: {
+        name: "LIGHT",
+        css: "theme-light",
+        colors: {
+          colBg:[242,245,248], colPanel:[255,255,255], colText:[22,28,36], colMuted:[95,110,128],
+          colOn:[18,150,88], colOff:[210,55,55], colHz:[185,130,10], colAccent:[170,190,210], colTrack:[40,120,175],
+        },
+      },
+    };
+
+    // uiRender titles[]
+    const PAGE_TITLES = ["OVERVIEW", "A CHANNEL", "B CHANNEL", "FEATURES", "SYSTEM"];
+    const PAGE_COUNT = 5; // kPageCount
+    const NO_SIGNAL_BLINK_MS = 450;
+
+    // brightnessPercentToLevel() — main.cpp
+    function brightnessPercentToLevel(percent) {
+      let level = Math.floor((percent * 16 + 50) / 100);
+      if (level < 1) level = 1;
+      if (level > 16) level = 16;
+      return level;
+    }
+
+    // formatHms()
+    function formatHms(totalSeconds) {
+      const hh = Math.floor(totalSeconds / 3600);
+      const mm = Math.floor((totalSeconds % 3600) / 60);
+      const ss = totalSeconds % 60;
+      return [hh, mm, ss].map((n) => String(n).padStart(2, "0")).join(":");
+    }
+
+    function onOff(v) { return v ? "ON" : "OFF"; }
+    function yesNo(v) { return v ? "YES" : "NO"; }
+
+    // levelColor()
+    function levelCssVar(level) {
+      if (level >= 2) return "var(--c-off)";
+      if (level === 1) return "var(--c-hz)";
+      return "var(--c-on)";
+    }
+
+    // ---- format helpers matching snprintf in ui.cpp ----
+    const Fmt = {
+      // OVERVIEW chips
+      nagChip: (s) => `${onOff(s.nag)} M${s.nagMode}`,
+      markChip: (s) => `${s.userMarkActive ? "RUN" : "IDLE"} ${s.userMarkCount}`,
+      hzCard: (hz) => `${Math.round(hz)} Hz`, // "%.0f Hz"
+      boCard: (bo) => `BO ${bo}`,
+
+      // A page
+      aHealth: (s) => `${s.aHealthState} / L${s.aHealthLevel}`,
+      aRateAge: (s) => `${s.hzA.toFixed(1)}Hz / ${s.aFrameAgeMs}ms`,
+      aEflg: (s) => `0x${(s.aEflg >>> 0).toString(16).toUpperCase().padStart(2, "0")}`,
+      aTecRec: (s) => `${s.aTec} / ${s.aRec}`,
+      aRxBo: (s) => `${s.aRxOverrun} / BO ${s.aBusoffCount}`,
+      aTx: (s) => `${s.aTxQueued} / ${s.aTxBusy} / ${s.aTxHard}${s.aTxGuard ? " G" : ""}`,
+
+      // B page
+      bHealth: (s) => `${s.bHealthState} / L${s.bHealthLevel}`,
+      bRateAge: (s) => `${s.hzB.toFixed(1)}Hz / ${s.bFrameAgeMs}ms`,
+      bTwaiBo: (s) => `${s.bTwaiState} / BO ${s.bBusoffCount}`,
+      bTecRec: (s) => `${s.bTec} / ${s.bRec}`,
+      bQuiet: (s) => `${s.bRecoveryQuietMs}ms / Echo ${s.bEchoCount}`,
+      bArb: (s) => `${s.bArbLost} / ${s.bBusError} / ${s.bTxFailed}`,
+
+      // FEATURES
+      aFeatures: (s) => `R79 ${onOff(s.eceR79)} / SUM ${onOff(s.summon)} / TS ${onOff(s.tsllc)}`,
+      nagRow: (s) => `${onOff(s.nag)} M${s.nagMode} / AP-ONLY ${yesNo(s.nagApOnly)}`,
+      apRow: (s) => `${onOff(s.apActive)} S${s.apState} / ${s.apStableMs}ms`,
+      vehicleGate: (s) => `P ${yesNo(s.parked)} / SUM ${yesNo(s.summoning)}`,
+      gateRow: (s) => `${s.gateOpen ? "OPEN" : "CLOSED"} / ${s.gateReason}`,
+      sumTx: (s) => `${s.summonTxOk} / ${s.summonTxFail} / ${s.summonBlocked}`,
+
+      // SYSTEM
+      fwRow: (s) => `${s.firmware} / OTA ${s.otaState}`,
+      wifiData: (s) => `${s.wifiRssi}dBm / age ${s.responseAgeMs}ms`,
+      httpRow: (s) => `${s.requestOk} / ${s.requestFail} / ${s.parseFail}`,
+      cpuRow: (ctx) => `${ctx.cpuMhz} MHz`,
+      brightRow: (ctx) => `${ctx.brightnessPercent}% (${ctx.backlightLevel}/16)`,
+      themeRow: (ctx) => (ctx.theme === "light" ? "LIGHT" : "DARK"),
+    };
+
+    // value color decisions from ui.cpp
+    const Color = {
+      aEflg: (s) => (s.aEflg ? "var(--c-hz)" : "var(--c-on)"),
+      aRxBo: (s) => ((s.aRxOverrun || s.aBusoffCount) ? "var(--c-hz)" : "var(--c-on)"),
+      aTx: (s) => (s.aTxGuard ? "var(--c-hz)" : "var(--c-text)"),
+      bTwai: (s) => (s.bTwaiState === 2 ? "var(--c-off)" : "var(--c-text)"),
+      bQuiet: (s) => (s.bRecoveryQuietMs ? "var(--c-hz)" : "var(--c-text)"),
+      bArb: (s) => ((s.bBusError || s.bTxFailed) ? "var(--c-hz)" : "var(--c-text)"),
+      nag: (s) => (s.nagReady ? "var(--c-on)" : "var(--c-hz)"),
+      gate: (s) => (s.gateOpen ? "var(--c-on)" : "var(--c-hz)"),
+      sumTx: (s) => (s.summonTxFail ? "var(--c-off)" : "var(--c-text)"),
+      wifi: (s) => (s.linked ? "var(--c-on)" : "var(--c-off)"),
+      http: (s) => (s.parseFail ? "var(--c-hz)" : "var(--c-text)"),
+      bo: (bo) => (bo ? "var(--c-off)" : "var(--c-muted)"),
+      chip: (active) => (active ? "var(--c-on)" : "var(--c-muted)"),
+      chipBorder: (active) => (active ? "var(--c-track)" : "var(--c-accent)"),
+    };
+
+    const $ = (id) => document.getElementById(id);
+    const canvas = $("canvas");
+    const screen = $("screen");
+
+    const ctx = {
+      currentPage: 0,
+      pageCount: PAGE_COUNT,
+      brightnessPercent: 80,
+      backlightLevel: 13,
+      systemSelected: 0,
+      savedPageBeforeBrightness: 0,
+      brightnessAdjustMode: false,
+      systemEditMode: false,
+      theme: "dark",
+      scale: 2,
+      cpuMhz: 80,
+      noSignalBlinkMs: NO_SIGNAL_BLINK_MS,
+      themeToastUntilMs: 0,
+    };
+
+    const state = {
+      linked: true,
+      aHealthState: "OK", bHealthState: "OK",
+      aHealthLevel: 0, bHealthLevel: 0,
+      hzA: 100, hzB: 50,
+      aBusoffCount: 0, bBusoffCount: 0,
+      aFrameAgeMs: 12, bFrameAgeMs: 20,
+      aEflg: 0, aTec: 0, aRec: 0, aRxOverrun: 0,
+      aTxQueued: 0, aTxBusy: 0, aTxHard: 0, aTxGuard: false,
+      bTwaiState: 1, bTec: 0, bRec: 0, bRecoveryQuietMs: 0,
+      bEchoCount: 12, bArbLost: 0, bBusError: 0, bTxFailed: 0,
+      eceR79: true, summon: false, tsllc: false,
+      nag: true, nagMode: 1, nagApOnly: false, nagReady: true,
+      apActive: false, apState: 0, apStableMs: 0,
+      parked: true, summoning: false,
+      gateOpen: false, gateReason: "NO_AP",
+      summonTxOk: 0, summonTxFail: 0, summonBlocked: 0,
+      userMarkActive: false, userMarkCount: 0,
+      firmware: "t2-can", build: "2026-08-04", otaState: 0,
+      wifiRssi: -48, responseAgeMs: 120,
+      requestOk: 42, requestFail: 1, parseFail: 0,
+      t2Uptime: 3661,
+    };
+
+    function el(tag, cls, styles, text) {
+      const n = document.createElement(tag);
+      if (cls) n.className = cls;
+      if (styles) Object.assign(n.style, styles);
+      if (text != null) n.textContent = text;
+      return n;
+    }
+
+    function drawHeader(root, pageIdx, title) {
+      const h = el("div", "hdr");
+      h.appendChild(el("span", "hint", null, "UP/DN"));
+      h.appendChild(el("span", "title", null, title));
+      h.appendChild(el("span", "pg", null, `${pageIdx + 1}/${ctx.pageCount}`));
+      root.appendChild(h);
+    }
+
+    function drawRow(root, y, key, value, valueColor, hl = false, sys = false) {
+      const cls = ["row"];
+      if (sys) cls.push("sys");
+      if (hl) cls.push("hl");
+      const r = el("div", cls.join(" "), { top: `${y}px` });
+      r.appendChild(el("span", "k", null, key));
+      const v = el("span", "v", valueColor ? { color: valueColor } : null, value);
+      r.appendChild(v);
+      root.appendChild(r);
+      return `${key}=${value}`;
+    }
+
+    function renderOverview(root, dump) {
+      drawHeader(root, 0, "OVERVIEW");
+      // A card x=8
+      const a = el("div", "hcard", { left: "8px", "--lv": levelCssVar(state.aHealthLevel) });
+      a.appendChild(el("div", "dot"));
+      a.appendChild(el("div", "ch", null, "A MCP2515"));
+      a.appendChild(el("div", "st", null, state.aHealthState));
+      a.appendChild(el("div", "hz", null, Fmt.hzCard(state.hzA)));
+      const abo = el("div", "bo", { color: Color.bo(state.aBusoffCount) }, Fmt.boCard(state.aBusoffCount));
+      a.appendChild(abo);
+      root.appendChild(a);
+      // B card x=164
+      const b = el("div", "hcard", { left: "164px", "--lv": levelCssVar(state.bHealthLevel) });
+      b.appendChild(el("div", "dot"));
+      b.appendChild(el("div", "ch", null, "B TWAI"));
+      b.appendChild(el("div", "st", null, state.bHealthState));
+      b.appendChild(el("div", "hz", null, Fmt.hzCard(state.hzB)));
+      b.appendChild(el("div", "bo", { color: Color.bo(state.bBusoffCount) }, Fmt.boCard(state.bBusoffCount)));
+      root.appendChild(b);
+
+      const chips = [
+        { x: 8, y: 103, k: "ECE R79", v: onOff(state.eceR79), on: state.eceR79 },
+        { x: 164, y: 103, k: "SUMMON", v: onOff(state.summon), on: state.summon },
+        { x: 8, y: 133, k: "NAG", v: Fmt.nagChip(state), on: state.nag },
+        { x: 164, y: 133, k: "USER MARK", v: Fmt.markChip(state), on: state.userMarkActive },
+      ];
+      chips.forEach((c) => {
+        const n = el("div", "chip", {
+          left: `${c.x}px`, top: `${c.y}px`,
+          "--chip-b": Color.chipBorder(c.on),
+        });
+        n.appendChild(el("span", "k", null, c.k));
+        n.appendChild(el("span", "v", { color: Color.chip(c.on) }, c.v));
+        root.appendChild(n);
+        dump.push(`chip ${c.k}: ${c.v}`);
+      });
+      dump.push(`A: ${state.aHealthState} ${Fmt.hzCard(state.hzA)} ${Fmt.boCard(state.aBusoffCount)}`);
+      dump.push(`B: ${state.bHealthState} ${Fmt.hzCard(state.hzB)} ${Fmt.boCard(state.bBusoffCount)}`);
+    }
+
+    function renderA(root, dump) {
+      drawHeader(root, 1, "A CHANNEL");
+      const rows = [
+        [34, "Health", Fmt.aHealth(state), levelCssVar(state.aHealthLevel)],
+        [54, "Rate / Age", Fmt.aRateAge(state), null],
+        [74, "EFLG", Fmt.aEflg(state), Color.aEflg(state)],
+        [94, "TEC / REC", Fmt.aTecRec(state), null],
+        [114, "RX OVR / BUS-OFF", Fmt.aRxBo(state), Color.aRxBo(state)],
+        [134, "TX Q / Busy / Hard", Fmt.aTx(state), Color.aTx(state)],
+      ];
+      rows.forEach(([y, k, v, c]) => dump.push(drawRow(root, y, k, v, c)));
+    }
+
+    function renderB(root, dump) {
+      drawHeader(root, 2, "B CHANNEL");
+      const rows = [
+        [34, "Health", Fmt.bHealth(state), levelCssVar(state.bHealthLevel)],
+        [54, "Rate / Age", Fmt.bRateAge(state), null],
+        [74, "TWAI / BUS-OFF", Fmt.bTwaiBo(state), Color.bTwai(state)],
+        [94, "TEC / REC", Fmt.bTecRec(state), null],
+        [114, "Recovery Quiet", Fmt.bQuiet(state), Color.bQuiet(state)],
+        [134, "ARB / Err / Fail", Fmt.bArb(state), Color.bArb(state)],
+      ];
+      rows.forEach(([y, k, v, c]) => dump.push(drawRow(root, y, k, v, c)));
+    }
+
+    function renderFeatures(root, dump) {
+      drawHeader(root, 3, "FEATURES");
+      const rows = [
+        [34, "A Features", Fmt.aFeatures(state), null],
+        [54, "Nag", Fmt.nagRow(state), Color.nag(state)],
+        [74, "Autopilot", Fmt.apRow(state), null],
+        [94, "Vehicle Gate", Fmt.vehicleGate(state), null],
+        [114, "Gate", Fmt.gateRow(state), Color.gate(state)],
+        [134, "SUM TX O/F/Block", Fmt.sumTx(state), Color.sumTx(state)],
+      ];
+      rows.forEach(([y, k, v, c]) => dump.push(drawRow(root, y, k, v, c)));
+    }
+
+    function renderSystem(root, dump) {
+      drawHeader(root, 4, "SYSTEM");
+      // y: 32,49,66,83,100,117,134,151 — ui.cpp drawSystemPage
+      const rows = [
+        [32, "T2 Firmware", Fmt.fwRow(state), null, false],
+        [49, "Build", state.build, null, false],
+        [66, "WiFi / Data", Fmt.wifiData(state), Color.wifi(state), false],
+        [83, "HTTP O/F/Parse", Fmt.httpRow(state), Color.http(state), false],
+        [100, "T2 Uptime", formatHms(state.t2Uptime), null, false],
+        [117, "CPU Profile", Fmt.cpuRow(ctx), null, ctx.systemEditMode && ctx.systemSelected === 0],
+        [134, "Brightness", Fmt.brightRow(ctx), null, ctx.systemEditMode && ctx.systemSelected === 1],
+        [151, "Theme", Fmt.themeRow(ctx), null, ctx.systemEditMode && ctx.systemSelected === 2],
+      ];
+      rows.forEach(([y, k, v, c, hl]) => dump.push(drawRow(root, y, k, v, c, hl, true)));
+      // E안: SYSTEM footer
+      const hint = el("div", null, {
+        position: "absolute", left: "10px", top: "161px",
+        fontSize: "10px", color: "var(--c-muted)",
+      }, ctx.systemEditMode
+        ? "EDIT: UP/DN move  UP-hold exec  DN-hold exit"
+        : "DN3s:THEME  DN2s:EDIT  Theme row: UP-hold toggle");
+      root.appendChild(hint);
+      dump.push(`hint: ${hint.textContent}`);
+    }
+
+    function renderBrightness(root, dump) {
+      // header uses savedPageBeforeBrightness for page number
+      drawHeader(root, ctx.savedPageBeforeBrightness, "BRIGHTNESS");
+      const p = el("div", "bp");
+      p.appendChild(el("div", "pct", null, `${ctx.brightnessPercent}%`));
+      const bar = el("div", "bar");
+      const fill = el("i", null, { width: `${ctx.brightnessPercent}%` });
+      bar.appendChild(fill);
+      p.appendChild(bar);
+      root.appendChild(p);
+      root.appendChild(el("div", "bhelp", null, "UP:+10  DOWN:-10"));
+      dump.push(`BRIGHTNESS ${ctx.brightnessPercent}% level=${ctx.backlightLevel}`);
+      dump.push(`header page# from savedPageBeforeBrightness=${ctx.savedPageBeforeBrightness}`);
+    }
+
+    function render() {
+      ctx.backlightLevel = brightnessPercentToLevel(ctx.brightnessPercent);
+
+      screen.classList.remove("theme-dark", "theme-light");
+      screen.classList.add(THEMES[ctx.theme].css);
+      screen.style.setProperty("--scale", ctx.scale);
+      $("screenScale").style.setProperty("--scale", ctx.scale);
+
+      canvas.innerHTML = "";
+      canvas.appendChild(el("div", "vguide l"));
+      canvas.appendChild(el("div", "vguide r"));
+
+      const dump = [];
+      if (ctx.brightnessAdjustMode) {
+        renderBrightness(canvas, dump);
+      } else {
+        const page = Math.min(ctx.currentPage, PAGE_COUNT - 1);
+        if (page === 0) renderOverview(canvas, dump);
+        else if (page === 1) renderA(canvas, dump);
+        else if (page === 2) renderB(canvas, dump);
+        else if (page === 3) renderFeatures(canvas, dump);
+        else renderSystem(canvas, dump);
+      }
+
+      // NO SIGNAL overlay — uiRender()
+      if (!ctx.brightnessAdjustMode && !state.linked) {
+        canvas.appendChild(el("div", "nosig", null, "NO SIGNAL"));
+        dump.push("NO SIGNAL overlay active");
+      }
+
+      // A안: 테마 토스트
+      if (ctx.themeToastUntilMs && Date.now() < ctx.themeToastUntilMs) {
+        const toast = el("div", null, {
+          position: "absolute", left: "60px", top: "68px", width: "200px", height: "34px",
+          background: "var(--c-panel)", border: "1px solid var(--c-hz)", borderRadius: "8px",
+          display: "grid", placeItems: "center", color: "var(--c-hz)",
+          fontWeight: "800", fontSize: "18px",
+        }, ctx.theme === "light" ? "THEME LIGHT" : "THEME DARK");
+        canvas.appendChild(toast);
+        dump.push(`toast: THEME ${THEMES[ctx.theme].name}`);
+      }
+
+      $("dump").textContent = dump.join("\n");
+      $("badgePage").innerHTML = `page <strong>${ctx.brightnessAdjustMode ? "BRIGHT" : `${ctx.currentPage} ${PAGE_TITLES[ctx.currentPage]}`}</strong>`;
+      $("badgeTheme").innerHTML = `theme <strong>${THEMES[ctx.theme].name}</strong>`;
+      $("badgeMode").innerHTML = `mode <strong>${ctx.brightnessAdjustMode ? "BrightnessAdjust" : ctx.systemEditMode ? "SystemEdit" : "PageView"}</strong>`;
+      $("badgeScale").innerHTML = `scale <strong>${ctx.scale}×</strong>`;
+
+      // page button active
+      document.querySelectorAll("#pageButtons button").forEach((b) => {
+        b.classList.toggle("active", Number(b.dataset.page) === ctx.currentPage && !ctx.brightnessAdjustMode);
+      });
+      $("btnBright").classList.toggle("active", ctx.brightnessAdjustMode);
+      $("btnSysEdit").classList.toggle("active", ctx.systemEditMode);
+      $("btnDark").classList.toggle("active", ctx.theme === "dark");
+      $("btnLight").classList.toggle("active", ctx.theme === "light");
+    }
+
+    // ---- feature matrix ----
+    const MATRIX = [
+      ["해상도", "320×170 rotation=1", "canvas 320×170", "SYNC"],
+      ["페이지 수", "kPageCount=5", "PAGE_COUNT=5", "SYNC"],
+      ["페이지 제목", "OVERVIEW/A/B/FEATURES/SYSTEM", "PAGE_TITLES 동일", "SYNC"],
+      ["헤더", "UP/DN + title + n/5", "drawHeader 동일", "SYNC"],
+      ["OVERVIEW 카드", "A MCP2515 / B TWAI health card", "좌표·BO·Hz 포맷 동일", "SYNC"],
+      ["OVERVIEW 칩", "ECE/SUMMON/NAG/USER MARK", "active border track/accent", "SYNC"],
+      ["A CHANNEL 행", "6행 y=34..134 step20", "포맷 Health/Rate/EFLG/TEC/RX/TX", "SYNC"],
+      ["B CHANNEL 행", "6행 TWAI/Recovery/ARB", "포맷·색 규칙 동일", "SYNC"],
+      ["FEATURES 행", "A Features/Nag/AP/Gate/SUM TX", "tsllc·nagApOnly·gateReason 포함", "SYNC"],
+      ["SYSTEM 행", "8행 y=32..151 step17", "CPU/Brightness/Theme 하이라이트", "SYNC"],
+      ["Theme 팔레트", "uiApplyThemePalette Dark/Light", "THEMES 동일 RGB", "SYNC"],
+      ["Theme 단축키 A", "DOWN 3s 토글 (SYSTEM 제외)", "T 키 / Theme 버튼", "SYNC"],
+      ["Theme 토스트", "THEME LIGHT/DARK 0.8s", "토스트 시뮬레이션", "SYNC"],
+      ["SYSTEM 힌트 E", "DN3s:THEME DN2s:EDIT …", "SYSTEM footer 동일 문구", "SYNC"],
+      ["Brightness 모드", "overlay + saved page#", "brightnessAdjustMode", "SYNC"],
+      ["밝기 레벨", "percent→1..16", "brightnessPercentToLevel", "SYNC"],
+      ["NO SIGNAL", "blink 450ms, 72,70 176x34", "동일 좌표·조건", "SYNC"],
+      ["데이터 소스", "HTTP /api/monitor JSON", "수동 UiState 샘플", "PREVIEW-ONLY"],
+      ["버튼 입력", "GPIO14/0 상태머신", "UI 버튼/키보드", "PREVIEW-ONLY"],
+    ];
+
+    function renderMatrix() {
+      const body = MATRIX.map(([feat, fw, pv, st]) => {
+        const cls = st === "SYNC" ? "ok" : "muted";
+        return `<tr><td>${feat}</td><td class="muted">${fw}</td><td class="muted">${pv}</td><td class="${cls}"><strong>${st}</strong></td></tr>`;
+      }).join("");
+      $("matrix").innerHTML = `<tr><th>기능</th><th>펌웨어</th><th>프리뷰</th><th>상태</th></tr>${body}`;
+      const syncN = MATRIX.filter((r) => r[3] === "SYNC").length;
+      $("badgeSync").className = "badge ok";
+      $("badgeSync").innerHTML = `matrix <strong>${syncN}/${MATRIX.length} mapped</strong>`;
+    }
+
+    // ---- bindings ----
+    function num(id) { return Number($(id).value); }
+    function str(id) { return $(id).value; }
+    function chk(id) { return $(id).checked; }
+
+    function readControls() {
+      ctx.brightnessPercent = num("brightIn");
+      ctx.systemSelected = num("sysSel");
+      ctx.cpuMhz = num("cpu");
+      state.linked = chk("linked");
+      state.aHealthState = str("aHealthState");
+      state.bHealthState = str("bHealthState");
+      state.aHealthLevel = num("aLv");
+      state.bHealthLevel = num("bLv");
+      state.hzA = num("hzA");
+      state.hzB = num("hzB");
+      state.aBusoffCount = num("aBo");
+      state.bBusoffCount = num("bBo");
+      state.eceR79 = chk("ece");
+      state.summon = chk("summon");
+      state.tsllc = chk("tsllc");
+      state.nag = chk("nag");
+      state.nagMode = num("nagMode");
+      state.nagApOnly = chk("nagApOnly");
+      state.nagReady = chk("nagReady");
+      state.userMarkActive = chk("markActive");
+      state.userMarkCount = num("markCount");
+      state.aFrameAgeMs = num("aAge");
+      state.aEflg = num("aEflg");
+      state.aTec = num("aTec");
+      state.aRec = num("aRec");
+      state.aRxOverrun = num("aOvr");
+      state.aTxQueued = num("aTxQ");
+      state.aTxBusy = num("aTxBusy");
+      state.aTxHard = num("aTxHard");
+      state.aTxGuard = chk("aTxGuard");
+      state.bFrameAgeMs = num("bAge");
+      state.bTwaiState = num("bTwai");
+      state.bTec = num("bTec");
+      state.bRec = num("bRec");
+      state.bRecoveryQuietMs = num("bQuiet");
+      state.bEchoCount = num("bEcho");
+      state.bArbLost = num("bArb");
+      state.bBusError = num("bErr");
+      state.bTxFailed = num("bFail");
+      state.apActive = chk("apActive");
+      state.apState = num("apState");
+      state.apStableMs = num("apStable");
+      state.parked = chk("parked");
+      state.summoning = chk("summoning");
+      state.gateOpen = chk("gateOpen");
+      state.gateReason = str("gateReason");
+      state.summonTxOk = num("sumOk");
+      state.summonTxFail = num("sumFail");
+      state.summonBlocked = num("sumBlock");
+      state.firmware = str("fw");
+      state.build = str("build");
+      state.otaState = num("ota");
+      state.wifiRssi = num("rssi");
+      state.responseAgeMs = num("age");
+      state.requestOk = num("ok");
+      state.requestFail = num("fail");
+      state.parseFail = num("parse");
+      state.t2Uptime = num("uptime");
+      render();
+    }
+
+    $("pageButtons").addEventListener("click", (e) => {
+      const b = e.target.closest("button[data-page]");
+      if (!b) return;
+      ctx.currentPage = Number(b.dataset.page);
+      ctx.brightnessAdjustMode = false;
+      if (ctx.currentPage !== 4) ctx.systemEditMode = false;
+      render();
+    });
+
+    $("btnBright").onclick = () => {
+      if (!ctx.brightnessAdjustMode) {
+        ctx.savedPageBeforeBrightness = ctx.currentPage;
+        ctx.brightnessAdjustMode = true;
+        ctx.systemEditMode = false;
+      } else {
+        ctx.brightnessAdjustMode = false;
+        ctx.currentPage = ctx.savedPageBeforeBrightness;
+      }
+      render();
+    };
+
+    $("btnSysEdit").onclick = () => {
+      ctx.brightnessAdjustMode = false;
+      ctx.currentPage = 4;
+      ctx.systemEditMode = !ctx.systemEditMode;
+      render();
+    };
+
+    function flashThemeToast() {
+      ctx.themeToastUntilMs = Date.now() + 800;
+      render();
+      setTimeout(() => {
+        ctx.themeToastUntilMs = 0;
+        render();
+      }, 820);
+    }
+    $("btnDark").onclick = () => { ctx.theme = "dark"; flashThemeToast(); };
+    $("btnLight").onclick = () => { ctx.theme = "light"; flashThemeToast(); };
+
+    document.querySelectorAll("button[data-scale]").forEach((b) => {
+      b.onclick = () => {
+        ctx.scale = Number(b.dataset.scale);
+        document.querySelectorAll("button[data-scale]").forEach((x) => x.classList.toggle("active", x === b));
+        render();
+      };
+    });
+
+    document.querySelectorAll("aside input, aside select").forEach((n) => {
+      n.addEventListener("input", readControls);
+      n.addEventListener("change", readControls);
+    });
+
+    window.addEventListener("keydown", (e) => {
+      if (e.target.matches("input, select, textarea")) return;
+      if (e.key === "ArrowRight") {
+        ctx.brightnessAdjustMode = false;
+        ctx.currentPage = (ctx.currentPage + 1) % PAGE_COUNT;
+        render();
+      } else if (e.key === "ArrowLeft") {
+        ctx.brightnessAdjustMode = false;
+        ctx.currentPage = (ctx.currentPage + PAGE_COUNT - 1) % PAGE_COUNT;
+        render();
+      } else if (e.key.toLowerCase() === "t") {
+        // A안 대응: DOWN 3s 테마 토글 시뮬레이션
+        ctx.theme = ctx.theme === "dark" ? "light" : "dark";
+        flashThemeToast();
+      } else if (e.key.toLowerCase() === "b") {
+        $("btnBright").click();
+      } else if (e.key.toLowerCase() === "e") {
+        $("btnSysEdit").click();
+      }
+    });
+
+    renderMatrix();
+    readControls();
+  </script>
+</body>
+</html>
